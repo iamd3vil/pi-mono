@@ -10,6 +10,7 @@
 ### Fixed
 
 - Fixed extension messages rendering twice on startup when `pi.sendMessage({ display: true })` is called during `session_start` ([#765](https://github.com/badlogic/pi-mono/pull/765) by [@dannote](https://github.com/dannote))
+- Fixed `PI_CODING_AGENT_DIR` env var not expanding tilde (`~`) to home directory ([#768](https://github.com/badlogic/pi-mono/pull/778) by [@aliou](https://github.com/aliou))
 
 ## [0.47.0] - 2026-01-16
 
@@ -860,7 +861,7 @@ The hooks API has been restructured with more granular events and better session
 
 - `ctx.waitForIdle()` - wait for agent to finish streaming
 - `ctx.newSession(options?)` - create new sessions with optional setup callback
-- `ctx.branch(entryId)` - branch from a specific entry
+- `ctx.fork(entryId) - fork from a specific entry, creating a new session file
 - `ctx.navigateTree(targetId, options?)` - navigate the session tree
 
 These methods are only on `HookCommandContext` (not `HookContext`) because they can deadlock if called from event handlers that run inside the agent loop.
