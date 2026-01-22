@@ -11,7 +11,7 @@
 
 A terminal-based coding agent with multi-model support, mid-session model switching, and a simple CLI for headless coding tasks.
 
-Works on Linux, macOS, and Windows (requires bash; see [Windows Setup](#windows-setup)).
+Works on Linux, macOS, and Windows (requires bash; see [Windows Setup](#windows-setup)). [Separately maintained port](https://github.com/VaclavSynacek/pi-coding-agent-termux) works on Termux/Android.
 
 ## Table of Contents
 
@@ -116,6 +116,17 @@ For most users, [Git for Windows](https://git-scm.com/download/win) is sufficien
 }
 ```
 
+**Alias expansion:** Pi runs bash in non-interactive mode (`bash -c`), which doesn't expand aliases by default. To enable your shell aliases:
+
+```json
+// ~/.pi/agent/settings.json
+{
+  "shellCommandPrefix": "shopt -s expand_aliases\neval \"$(grep '^alias ' ~/.zshrc)\""
+}
+```
+
+Adjust the path (`~/.zshrc`, `~/.bashrc`, etc.) to match your shell config.
+
 ### Terminal Setup
 
 Pi uses the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) for reliable modifier key detection. Most modern terminals support this protocol, but some require configuration.
@@ -149,9 +160,22 @@ return config
 }
 ```
 
-**Windows Terminal:** Does not support the Kitty keyboard protocol. Shift+Enter cannot be distinguished from Enter. Use Ctrl+Enter for multi-line input instead. All other keybindings work correctly.
+**Windows Terminal:** Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file):
 
-**IntelliJ IDEA (Integrated Terminal):** The built-in terminal has limited escape sequence support. If you experience cursor visibility issues, set `PI_NO_HARDWARE_CURSOR=1` before running pi. Note that Shift+Enter cannot be distinguished from Enter in IntelliJ's terminal. Consider using a dedicated terminal emulator for the best experience.
+```json
+{
+  "actions": [
+    {
+      "command": { "action": "sendInput", "input": "\u001b[13;2u" },
+      "keys": "shift+enter"
+    }
+  ]
+}
+```
+
+If you already have an `actions` array, add the object to it.
+
+**IntelliJ IDEA (Integrated Terminal):** The built-in terminal has limited escape sequence support. Note that Shift+Enter cannot be distinguished from Enter in IntelliJ's terminal. If you want the hardware cursor visible, set `PI_HARDWARE_CURSOR=1` before running pi (disabled by default for compatibility). Consider using a dedicated terminal emulator for the best experience.
 
 ### API Keys & OAuth
 
@@ -181,6 +205,7 @@ Add API keys to `~/.pi/agent/auth.json`:
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 | Vercel AI Gateway | `vercel-ai-gateway` | `AI_GATEWAY_API_KEY` |
 | ZAI | `zai` | `ZAI_API_KEY` |
+| OpenCode Zen | `opencode` | `OPENCODE_API_KEY` |
 | MiniMax | `minimax` | `MINIMAX_API_KEY` |
 | MiniMax (China) | `minimax-cn` | `MINIMAX_CN_API_KEY` |
 
@@ -290,6 +315,7 @@ The agent reads, writes, and edits files, and executes commands via bash.
 | `/new` | Start a new session |
 | `/copy` | Copy last agent message to clipboard |
 | `/compact [instructions]` | Manually compact conversation context |
+| `/reload` | Reload extensions, skills, prompts, and themes |
 
 ### Editor Features
 
@@ -325,8 +351,12 @@ Both modes are configurable via `/settings`: "one-at-a-time" delivers messages o
 | Enter | Send message |
 | Shift+Enter | New line (Ctrl+Enter on Windows Terminal) |
 | Ctrl+W / Option+Backspace | Delete word backwards |
+| Alt+D / Option+Delete | Delete word forwards |
 | Ctrl+U | Delete to start of line |
 | Ctrl+K | Delete to end of line |
+| Ctrl+Y | Paste most recently deleted text |
+| Alt+Y | Cycle through deleted text after pasting |
+| Ctrl+- | Undo |
 
 **Other:**
 
@@ -372,8 +402,12 @@ All keyboard shortcuts can be customized via `~/.pi/agent/keybindings.json`. Eac
 | `deleteCharBackward` | `backspace` | Delete char backward |
 | `deleteCharForward` | `delete` | Delete char forward |
 | `deleteWordBackward` | `ctrl+w`, `alt+backspace` | Delete word backward |
+| `deleteWordForward` | `alt+d`, `alt+delete` | Delete word forward |
 | `deleteToLineStart` | `ctrl+u` | Delete to line start |
 | `deleteToLineEnd` | `ctrl+k` | Delete to line end |
+| `yank` | `ctrl+y` | Paste most recently deleted text |
+| `yankPop` | `alt+y` | Cycle through deleted text after pasting |
+| `undo` | `ctrl+-` | Undo last edit |
 | `newLine` | `shift+enter` | Insert new line |
 | `submit` | `enter` | Submit input |
 | `tab` | `tab` | Tab/autocomplete |
@@ -510,6 +544,10 @@ pi --session /path/to/file.jsonl  # Use specific session file
 pi --session a8ec1c2a             # Resume by session ID (partial UUID)
 ```
 
+In the `/resume` picker:
+- `Ctrl+P` toggles display of the session `.jsonl` file path
+- `Ctrl+D` deletes the selected session (inline confirmation; uses `trash` if available and cannot delete the active session)
+
 **Resuming by session ID:** The `--session` flag accepts a session UUID (or prefix). Session IDs are visible in filenames under `~/.pi/agent/sessions/<project>/` (e.g., `2025-12-13T17-47-46-817Z_a8ec1c2a-5a5f-4699-88cb-03e7d3cb9292.jsonl`). The UUID is the part after the underscore. You can also search by session ID in the `pi -r` picker.
 
 ### Context Compaction
@@ -643,7 +681,10 @@ Add custom models (Ollama, vLLM, LM Studio, etc.) via `~/.pi/agent/models.json`:
 
 **Supported APIs:** `openai-completions`, `openai-responses`, `openai-codex-responses`, `anthropic-messages`, `google-generative-ai`
 
-**API key resolution:** The `apiKey` field is checked as environment variable name first, then used as literal value.
+**API key resolution:** The `apiKey` field supports three formats:
+- `"!command"` - Executes the command and uses stdout (e.g., `"!security find-generic-password -ws 'anthropic'"` for macOS Keychain, `"!op read 'op://vault/item/credential'"` for 1Password)
+- Environment variable name (e.g., `"MY_API_KEY"`) - Uses the value of the environment variable
+- Literal value - Used directly as the API key
 
 **API override:** Set `api` at provider level (default for all models) or model level (override per model).
 
@@ -701,6 +742,8 @@ To fully replace a built-in provider with custom models, include the `models` ar
 
 **OpenAI compatibility (`compat` field):**
 
+**OpenAI Completions (`openai-completions`):**
+
 | Field | Description |
 |-------|-------------|
 | `supportsStore` | Whether provider supports `store` field |
@@ -741,6 +784,7 @@ Global `~/.pi/agent/settings.json` stores persistent preferences:
   "steeringMode": "one-at-a-time",
   "followUpMode": "one-at-a-time",
   "shellPath": "C:\\path\\to\\bash.exe",
+  "shellCommandPrefix": "shopt -s expand_aliases",
   "hideThinkingBlock": false,
   "collapseChangelog": false,
   "compaction": {
@@ -748,9 +792,10 @@ Global `~/.pi/agent/settings.json` stores persistent preferences:
     "reserveTokens": 16384,
     "keepRecentTokens": 20000
   },
-  "skills": {
-    "enabled": true
-  },
+  "skills": ["/path/to/skills"],
+  "prompts": ["/path/to/prompts"],
+  "themes": ["/path/to/themes"],
+  "enableSkillCommands": true,
   "retry": {
     "enabled": true,
     "maxRetries": 3,
@@ -763,6 +808,7 @@ Global `~/.pi/agent/settings.json` stores persistent preferences:
     "autoResize": true,
     "blockImages": false
   },
+  "showHardwareCursor": false,
   "extensions": ["/path/to/extension.ts"]
 }
 ```
@@ -777,20 +823,27 @@ Global `~/.pi/agent/settings.json` stores persistent preferences:
 | `steeringMode` | Steering message delivery: `all` or `one-at-a-time` | `one-at-a-time` |
 | `followUpMode` | Follow-up message delivery: `all` or `one-at-a-time` | `one-at-a-time` |
 | `shellPath` | Custom bash path (Windows) | auto-detected |
+| `shellCommandPrefix` | Command prefix for bash (e.g., `shopt -s expand_aliases` for alias support) | - |
 | `hideThinkingBlock` | Hide thinking blocks in output (Ctrl+T to toggle) | `false` |
 | `collapseChangelog` | Show condensed changelog after update | `false` |
 | `compaction.enabled` | Enable auto-compaction | `true` |
 | `compaction.reserveTokens` | Tokens to reserve before compaction triggers | `16384` |
 | `compaction.keepRecentTokens` | Recent tokens to keep after compaction | `20000` |
-| `skills.enabled` | Enable skills discovery | `true` |
+| `skills` | Additional skill file or directory paths | `[]` |
+| `prompts` | Additional prompt template paths | `[]` |
+| `themes` | Additional theme file or directory paths | `[]` |
+| `enableSkillCommands` | Register skills as `/skill:name` commands | `true` |
 | `retry.enabled` | Auto-retry on transient errors | `true` |
 | `retry.maxRetries` | Maximum retry attempts | `3` |
 | `retry.baseDelayMs` | Base delay for exponential backoff | `2000` |
 | `terminal.showImages` | Render images inline (supported terminals) | `true` |
 | `images.autoResize` | Auto-resize images to 2000x2000 max for better model compatibility | `true` |
 | `images.blockImages` | Prevent images from being sent to LLM providers | `false` |
-| `doubleEscapeAction` | Action for double-escape with empty editor: `tree` or `branch` | `tree` |
-| `extensions` | Additional extension file paths | `[]` |
+| `showHardwareCursor` | Show terminal cursor while still positioning it for IME support | `false` |
+| `doubleEscapeAction` | Action for double-escape with empty editor: `tree` or `fork` | `tree` |
+| `editorPaddingX` | Horizontal padding for input editor (0-3) | `0` |
+| `markdown.codeBlockIndent` | Prefix for each rendered code block line | `"  "` |
+| `extensions` | Extension sources or file paths (npm:, git:, local) | `[]` |
 
 ---
 
@@ -803,6 +856,8 @@ Built-in themes: `dark` (default), `light`. Auto-detected on first run.
 Select theme via `/settings` or set in `~/.pi/agent/settings.json`.
 
 **Custom themes:** Create `~/.pi/agent/themes/*.json`. Custom themes support live reload.
+
+Add additional theme paths via `settings.json` `themes` array or `--theme <path>`. Disable automatic theme discovery with `--no-themes`.
 
 ```bash
 mkdir -p ~/.pi/agent/themes
@@ -822,6 +877,8 @@ Define reusable prompts as Markdown files:
 **Locations:**
 - Global: `~/.pi/agent/prompts/*.md`
 - Project: `.pi/prompts/*.md`
+- Additional paths from settings.json `prompts` array
+- CLI `--prompt-template` paths
 
 **Format:**
 
@@ -852,6 +909,8 @@ Usage: `/component Button "onClick handler" "disabled support"`
 - `${@:N}` = arguments from the Nth position onwards (1-indexed)
 - `${@:N:L}` = `L` arguments starting from the Nth position
 
+Disable prompt template discovery with `--no-prompt-templates`.
+
 **Namespacing:** Subdirectories create prefixes. `.pi/prompts/frontend/component.md` → `/component (project:frontend)`
 
 
@@ -870,10 +929,12 @@ A skill provides specialized workflows, setup instructions, helper scripts, and 
 - YouTube transcript extraction
 
 **Skill locations:**
-- Pi user: `~/.pi/agent/skills/**/SKILL.md` (recursive)
-- Pi project: `.pi/skills/**/SKILL.md` (recursive)
-- Claude Code: `~/.claude/skills/*/SKILL.md` and `.claude/skills/*/SKILL.md`
-- Codex CLI: `~/.codex/skills/**/SKILL.md` (recursive)
+- Global: `~/.pi/agent/skills/`
+- Project: `.pi/skills/`
+- Additional paths from settings.json `skills` array
+- CLI `--skill` paths (additive even with `--no-skills`)
+
+Use `enableSkillCommands` in settings to toggle `/skill:name` commands.
 
 **Format:**
 
@@ -900,7 +961,7 @@ cd /path/to/brave-search && npm install
 - `name`: Required. Must match parent directory name. Lowercase, hyphens, max 64 chars.
 - `description`: Required. Max 1024 chars. Determines when the skill is loaded.
 
-**Disable skills:** `pi --no-skills` or set `skills.enabled: false` in settings.
+**Disable skills:** `pi --no-skills` (automatic discovery off, explicit `--skill` paths still load).
 
 > See [docs/skills.md](docs/skills.md) for details, examples, and links to skill repositories. pi can help you create new skills.
 
@@ -919,7 +980,18 @@ Extensions are TypeScript modules that extend pi's behavior.
 **Locations:**
 - Global: `~/.pi/agent/extensions/*.ts` or `~/.pi/agent/extensions/*/index.ts`
 - Project: `.pi/extensions/*.ts` or `.pi/extensions/*/index.ts`
-- CLI: `--extension <path>` or `-e <path>`
+- Settings: `extensions` array supports file paths and `npm:` or `git:` sources
+- CLI: `--extension <path>` or `-e <path>` (temporary for this run)
+
+Install and remove extension sources with the CLI:
+
+```bash
+pi install npm:@foo/bar@1.0.0
+pi install git:github.com/user/repo@v1
+pi remove npm:@foo/bar
+```
+
+Use `-l` to install into project settings (`.pi/settings.json`).
 
 **Dependencies:** Extensions can have their own dependencies. Place a `package.json` next to the extension (or in a parent directory), run `npm install`, and imports are resolved via [jiti](https://github.com/unjs/jiti). See [examples/extensions/with-deps/](examples/extensions/with-deps/).
 
@@ -1129,8 +1201,9 @@ ctx.ui.notify("Done!", "success"); // success, info, warning, error
 ctx.ui.setStatus("my-ext", "Processing...");
 ctx.ui.setStatus("my-ext", null); // Clear
 
-// Widgets (above editor)
+// Widgets (above editor by default)
 ctx.ui.setWidget("my-ext", ["Line 1", "Line 2"]);
+ctx.ui.setWidget("my-ext", ["Line 1", "Line 2"], { placement: "belowEditor" });
 
 // Custom footer (replaces built-in footer)
 ctx.ui.setFooter((tui, theme) => ({
@@ -1165,11 +1238,20 @@ await ctx.ui.custom((tui, theme, done) => ({
 pi [options] [@files...] [messages...]
 ```
 
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `install <source> [-l]` | Install extension source and add to settings (`-l` for project) |
+| `remove <source> [-l]` | Remove extension source from settings |
+| `update [source]` | Update installed extensions (skips pinned sources) |
+| `list` | List installed extensions from settings |
+
 ### Options
 
 | Option | Description |
 |--------|-------------|
-| `--provider <name>` | Provider: `anthropic`, `openai`, `openai-codex`, `google`, `google-vertex`, `amazon-bedrock`, `mistral`, `xai`, `groq`, `cerebras`, `openrouter`, `vercel-ai-gateway`, `zai`, `minimax`, `minimax-cn`, `github-copilot`, `google-gemini-cli`, `google-antigravity`, or custom |
+| `--provider <name>` | Provider: `anthropic`, `openai`, `openai-codex`, `google`, `google-vertex`, `amazon-bedrock`, `mistral`, `xai`, `groq`, `cerebras`, `openrouter`, `vercel-ai-gateway`, `zai`, `opencode`, `minimax`, `minimax-cn`, `github-copilot`, `google-gemini-cli`, `google-antigravity`, or custom |
 | `--model <id>` | Model ID |
 | `--api-key <key>` | API key (overrides environment) |
 | `--system-prompt <text\|file>` | Custom system prompt (text or file path) |
@@ -1187,8 +1269,12 @@ pi [options] [@files...] [messages...]
 | `--thinking <level>` | Thinking level: `off`, `minimal`, `low`, `medium`, `high` |
 | `--extension <path>`, `-e` | Load an extension file (can be used multiple times) |
 | `--no-extensions` | Disable extension discovery (explicit `-e` paths still work) |
+| `--skill <path>` | Load a skill file or directory (can be used multiple times) |
+| `--prompt-template <path>` | Load a prompt template file or directory (can be used multiple times) |
+| `--theme <path>` | Load a theme file or directory (can be used multiple times) |
 | `--no-skills` | Disable skills discovery and loading |
-| `--skills <patterns>` | Comma-separated glob patterns to filter skills (e.g., `git-*,docker`) |
+| `--no-prompt-templates` | Disable prompt template discovery and loading |
+| `--no-themes` | Disable theme discovery and loading |
 | `--export <file> [output]` | Export session to HTML |
 | `--help`, `-h` | Show help |
 | `--version`, `-v` | Show version |
@@ -1290,10 +1376,10 @@ For adding new tools, see [Extensions](#extensions) in the Customization section
 For embedding pi in Node.js/TypeScript applications, use the SDK:
 
 ```typescript
-import { createAgentSession, discoverAuthStorage, discoverModels, SessionManager } from "@mariozechner/pi-coding-agent";
+import { AuthStorage, createAgentSession, ModelRegistry, SessionManager } from "@mariozechner/pi-coding-agent";
 
-const authStorage = discoverAuthStorage();
-const modelRegistry = discoverModels(authStorage);
+const authStorage = new AuthStorage();
+const modelRegistry = new ModelRegistry(authStorage);
 
 const { session } = await createAgentSession({
   sessionManager: SessionManager.inMemory(),
@@ -1312,15 +1398,13 @@ await session.prompt("What files are in the current directory?");
 
 The SDK provides full control over:
 - Model selection and thinking level
-- System prompt (replace or modify)
 - Tools (built-in subsets, custom tools)
-- Extensions (discovered or via paths)
-- Skills, context files, prompt templates
+- Resources via `ResourceLoader` (extensions, skills, prompts, themes, context files, system prompt)
 - Session persistence (`SessionManager`)
 - Settings (`SettingsManager`)
 - API key resolution and OAuth
 
-**Philosophy:** "Omit to discover, provide to override." Omit an option and pi discovers from standard locations. Provide an option and your value is used.
+**Philosophy:** "Omit to discover, provide to override." Resource discovery is handled by `ResourceLoader`, while model and tool options still follow the omit or override pattern.
 
 > See [SDK Documentation](docs/sdk.md) for the full API reference. See [examples/sdk/](examples/sdk/) for working examples from minimal to full control.
 

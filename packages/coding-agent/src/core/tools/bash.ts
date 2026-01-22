@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
 import { spawn } from "child_process";
-import { getShellConfig, killProcessTree } from "../../utils/shell.js";
+import { getShellConfig, getShellEnv, killProcessTree } from "../../utils/shell.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateTail } from "./truncate.js";
 
 /**
@@ -65,6 +65,7 @@ const defaultBashOperations: BashOperations = {
 			const child = spawn(shell, [...args, command], {
 				cwd,
 				detached: true,
+				env: getShellEnv(),
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 
@@ -135,10 +136,13 @@ const defaultBashOperations: BashOperations = {
 export interface BashToolOptions {
 	/** Custom operations for command execution. Default: local shell */
 	operations?: BashOperations;
+	/** Command prefix prepended to every command (e.g., "shopt -s expand_aliases" for alias support) */
+	commandPrefix?: string;
 }
 
 export function createBashTool(cwd: string, options?: BashToolOptions): AgentTool<typeof bashSchema> {
 	const ops = options?.operations ?? defaultBashOperations;
+	const commandPrefix = options?.commandPrefix;
 
 	return {
 		name: "bash",
@@ -151,6 +155,9 @@ export function createBashTool(cwd: string, options?: BashToolOptions): AgentToo
 			signal?: AbortSignal,
 			onUpdate?,
 		) => {
+			// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
+			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
+
 			return new Promise((resolve, reject) => {
 				// We'll stream to a temp file if output gets large
 				let tempFilePath: string | undefined;
@@ -206,7 +213,7 @@ export function createBashTool(cwd: string, options?: BashToolOptions): AgentToo
 					}
 				};
 
-				ops.exec(command, cwd, { onData: handleData, signal, timeout })
+				ops.exec(resolvedCommand, cwd, { onData: handleData, signal, timeout })
 					.then(({ exitCode }) => {
 						// Close temp file stream
 						if (tempFileStream) {

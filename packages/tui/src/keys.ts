@@ -642,9 +642,26 @@ function matchesModifyOtherKeys(data: string, expectedKeycode: number, expectedM
 // Generic Key Matching
 // =============================================================================
 
-function rawCtrlChar(letter: string): string {
-	const code = letter.toLowerCase().charCodeAt(0) - 96;
-	return String.fromCharCode(code);
+/**
+ * Get the control character for a key.
+ * Uses the universal formula: code & 0x1f (mask to lower 5 bits)
+ *
+ * Works for:
+ * - Letters a-z → 1-26
+ * - Symbols [\]_ → 27, 28, 29, 31
+ * - Also maps - to same as _ (same physical key on US keyboards)
+ */
+function rawCtrlChar(key: string): string | null {
+	const char = key.toLowerCase();
+	const code = char.charCodeAt(0);
+	if ((code >= 97 && code <= 122) || char === "[" || char === "\\" || char === "]" || char === "_") {
+		return String.fromCharCode(code & 0x1f);
+	}
+	// Handle - as _ (same physical key on US keyboards)
+	if (char === "-") {
+		return String.fromCharCode(31); // Same as Ctrl+_
+	}
+	return null;
 }
 
 function parseKeyId(keyId: string): { key: string; ctrl: boolean; shift: boolean; alt: boolean } | null {
@@ -966,15 +983,21 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 	// Handle single letter keys (a-z) and some symbols
 	if (key.length === 1 && ((key >= "a" && key <= "z") || SYMBOL_KEYS.has(key))) {
 		const codepoint = key.charCodeAt(0);
+		const rawCtrl = rawCtrlChar(key);
 
-		if (ctrl && alt && !shift && !_kittyProtocolActive && key >= "a" && key <= "z") {
-			return data === `\x1b${rawCtrlChar(key)}`;
+		if (ctrl && alt && !shift && !_kittyProtocolActive && rawCtrl) {
+			// Legacy: ctrl+alt+key is ESC followed by the control character
+			return data === `\x1b${rawCtrl}`;
+		}
+
+		if (alt && !ctrl && !shift && !_kittyProtocolActive && key >= "a" && key <= "z") {
+			// Legacy: alt+letter is ESC followed by the letter
+			if (data === `\x1b${key}`) return true;
 		}
 
 		if (ctrl && !shift && !alt) {
-			const raw = rawCtrlChar(key);
-			if (data === raw) return true;
-			if (data.length > 0 && data.charCodeAt(0) === raw.charCodeAt(0)) return true;
+			// Legacy: ctrl+key sends the control character
+			if (rawCtrl && data === rawCtrl) return true;
 			return matchesKittySequence(data, codepoint, MODIFIERS.ctrl);
 		}
 
@@ -1057,6 +1080,13 @@ export function parseKey(data: string): string | undefined {
 
 	// Legacy sequences (used when Kitty protocol is not active, or for unambiguous sequences)
 	if (data === "\x1b") return "escape";
+	if (data === "\x1c") return "ctrl+\\";
+	if (data === "\x1d") return "ctrl+]";
+	if (data === "\x1f") return "ctrl+-";
+	if (data === "\x1b\x1b") return "ctrl+alt+[";
+	if (data === "\x1b\x1c") return "ctrl+alt+\\";
+	if (data === "\x1b\x1d") return "ctrl+alt+]";
+	if (data === "\x1b\x1f") return "ctrl+alt+-";
 	if (data === "\t") return "tab";
 	if (data === "\r" || (!_kittyProtocolActive && data === "\n") || data === "\x1bOM") return "enter";
 	if (data === "\x00") return "ctrl+space";
@@ -1072,6 +1102,10 @@ export function parseKey(data: string): string | undefined {
 		const code = data.charCodeAt(1);
 		if (code >= 1 && code <= 26) {
 			return `ctrl+alt+${String.fromCharCode(code + 96)}`;
+		}
+		// Legacy alt+letter (ESC followed by letter a-z)
+		if (code >= 97 && code <= 122) {
+			return `alt+${String.fromCharCode(code)}`;
 		}
 	}
 	if (data === "\x1b[A") return "up";

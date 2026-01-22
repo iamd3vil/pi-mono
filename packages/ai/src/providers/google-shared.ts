@@ -59,10 +59,10 @@ function resolveThoughtSignature(isSameProviderAndModel: boolean, signature: str
 }
 
 /**
- * Claude models via Google APIs require explicit tool call IDs in function calls/responses.
+ * Models via Google APIs that require explicit tool call IDs in function calls/responses.
  */
 export function requiresToolCallId(modelId: string): boolean {
-	return modelId.startsWith("claude-");
+	return modelId.startsWith("claude-") || modelId.startsWith("gpt-oss-");
 }
 
 /**
@@ -70,7 +70,12 @@ export function requiresToolCallId(modelId: string): boolean {
  */
 export function convertMessages<T extends GoogleApiType>(model: Model<T>, context: Context): Content[] {
 	const contents: Content[] = [];
-	const transformedMessages = transformMessages(context.messages, model);
+	const normalizeToolCallId = (id: string): string => {
+		if (!requiresToolCallId(model.id)) return id;
+		return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+	};
+
+	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
 
 	for (const msg of transformedMessages) {
 		if (msg.role === "user") {
@@ -135,11 +140,12 @@ export function convertMessages<T extends GoogleApiType>(model: Model<T>, contex
 					// Gemini 3 requires thoughtSignature on all function calls when thinking mode is enabled.
 					// When replaying history from providers without thought signatures (e.g. Claude via Antigravity),
 					// convert unsigned function calls to text to avoid API validation errors.
+					// We include a note telling the model this is historical context to prevent mimicry.
 					const isGemini3 = model.id.toLowerCase().includes("gemini-3");
 					if (isGemini3 && !thoughtSignature) {
 						const argsStr = JSON.stringify(block.arguments, null, 2);
 						parts.push({
-							text: `[Tool Call: ${block.name}]\nArguments: ${argsStr}`,
+							text: `[Historical context: a different model called tool "${block.name}" with arguments: ${argsStr}. Do not mimic this format - use proper function calling.]`,
 						});
 					} else {
 						const part: Part = {

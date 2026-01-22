@@ -22,6 +22,7 @@ import type {
 	EditorComponent,
 	EditorTheme,
 	KeyId,
+	MarkdownTheme,
 	OverlayHandle,
 	OverlayOptions,
 	SlashCommand,
@@ -42,20 +43,29 @@ import {
 	visibleWidth,
 } from "@mariozechner/pi-tui";
 import { spawn, spawnSync } from "child_process";
-import { APP_NAME, getAuthPath, getDebugLogPath, isBunBinary, isBunRuntime, VERSION } from "../../config.js";
+import {
+	APP_NAME,
+	getAuthPath,
+	getDebugLogPath,
+	getShareViewerUrl,
+	isBunBinary,
+	isBunRuntime,
+	VERSION,
+} from "../../config.js";
 import type { AgentSession, AgentSessionEvent } from "../../core/agent-session.js";
+import type { CompactionResult } from "../../core/compaction/index.js";
 import type {
 	ExtensionContext,
 	ExtensionRunner,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { type AppAction, KeybindingsManager } from "../../core/keybindings.js";
 import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { resolveModelScope } from "../../core/model-resolver.js";
 import { type SessionContext, SessionManager } from "../../core/session-manager.js";
-import { loadProjectContextFiles } from "../../core/system-prompt.js";
 import type { TruncationResult } from "../../core/tools/truncate.js";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
@@ -145,7 +155,6 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private hasRenderedInitialMessages = false;
 	private onInputCallback?: (text: string) => void;
 	private loadingAnimation: Loader | undefined = undefined;
 	private readonly defaultWorkingMessage = "Working...";
@@ -205,9 +214,11 @@ export class InteractiveMode {
 	private extensionInput: ExtensionInputComponent | undefined = undefined;
 	private extensionEditor: ExtensionEditorComponent | undefined = undefined;
 
-	// Extension widgets (components rendered above the editor)
-	private extensionWidgets = new Map<string, Component & { dispose?(): void }>();
-	private widgetContainer!: Container;
+	// Extension widgets (components rendered above/below the editor)
+	private extensionWidgetsAbove = new Map<string, Component & { dispose?(): void }>();
+	private extensionWidgetsBelow = new Map<string, Component & { dispose?(): void }>();
+	private widgetContainerAbove!: Container;
+	private widgetContainerBelow!: Container;
 
 	// Custom footer from extension (undefined = use built-in footer)
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
@@ -235,13 +246,15 @@ export class InteractiveMode {
 	) {
 		this.session = session;
 		this.version = VERSION;
-		this.ui = new TUI(new ProcessTerminal());
+		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
-		this.widgetContainer = new Container();
+		this.widgetContainerAbove = new Container();
+		this.widgetContainerBelow = new Container();
 		this.keybindings = KeybindingsManager.create();
-		this.defaultEditor = new CustomEditor(this.ui, getEditorTheme(), this.keybindings);
+		const editorPaddingX = this.settingsManager.getEditorPaddingX();
+		this.defaultEditor = new CustomEditor(this.ui, getEditorTheme(), this.keybindings, { paddingX: editorPaddingX });
 		this.editor = this.defaultEditor;
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
@@ -306,6 +319,7 @@ export class InteractiveMode {
 			{ name: "new", description: "Start a new session" },
 			{ name: "compact", description: "Manually compact the session context" },
 			{ name: "resume", description: "Resume a different session" },
+			{ name: "reload", description: "Reload extensions, skills, prompts, and themes" },
 		];
 
 		// Convert prompt templates to SlashCommand format for autocomplete
@@ -357,64 +371,78 @@ export class InteractiveMode {
 		this.fdPath = await ensureTool("fd");
 		this.setupAutocomplete(this.fdPath);
 
-		// Add header with keybindings from config
-		const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
+		// Add header with keybindings from config (unless silenced)
+		if (!this.settingsManager.getQuietStartup()) {
+			const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
 
-		// Build startup instructions using keybinding hint helpers
-		const kb = this.keybindings;
-		const hint = (action: AppAction, desc: string) => appKeyHint(kb, action, desc);
+			// Build startup instructions using keybinding hint helpers
+			const kb = this.keybindings;
+			const hint = (action: AppAction, desc: string) => appKeyHint(kb, action, desc);
 
-		const instructions = [
-			hint("interrupt", "to interrupt"),
-			hint("clear", "to clear"),
-			rawKeyHint(`${appKey(kb, "clear")} twice`, "to exit"),
-			hint("exit", "to exit (empty)"),
-			hint("suspend", "to suspend"),
-			keyHint("deleteToLineEnd", "to delete to end"),
-			hint("cycleThinkingLevel", "to cycle thinking"),
-			rawKeyHint(`${appKey(kb, "cycleModelForward")}/${appKey(kb, "cycleModelBackward")}`, "to cycle models"),
-			hint("selectModel", "to select model"),
-			hint("expandTools", "to expand tools"),
-			hint("toggleThinking", "to toggle thinking"),
-			hint("externalEditor", "for external editor"),
-			rawKeyHint("/", "for commands"),
-			rawKeyHint("!", "to run bash"),
-			rawKeyHint("!!", "to run bash (no context)"),
-			hint("followUp", "to queue follow-up"),
-			hint("dequeue", "to edit all queued messages"),
-			hint("pasteImage", "to paste image"),
-			rawKeyHint("drop files", "to attach"),
-		].join("\n");
-		this.builtInHeader = new Text(`${logo}\n${instructions}`, 1, 0);
+			const instructions = [
+				hint("interrupt", "to interrupt"),
+				hint("clear", "to clear"),
+				rawKeyHint(`${appKey(kb, "clear")} twice`, "to exit"),
+				hint("exit", "to exit (empty)"),
+				hint("suspend", "to suspend"),
+				keyHint("deleteToLineEnd", "to delete to end"),
+				hint("cycleThinkingLevel", "to cycle thinking"),
+				rawKeyHint(`${appKey(kb, "cycleModelForward")}/${appKey(kb, "cycleModelBackward")}`, "to cycle models"),
+				hint("selectModel", "to select model"),
+				hint("expandTools", "to expand tools"),
+				hint("toggleThinking", "to toggle thinking"),
+				hint("externalEditor", "for external editor"),
+				rawKeyHint("/", "for commands"),
+				rawKeyHint("!", "to run bash"),
+				rawKeyHint("!!", "to run bash (no context)"),
+				hint("followUp", "to queue follow-up"),
+				hint("dequeue", "to edit all queued messages"),
+				hint("pasteImage", "to paste image"),
+				rawKeyHint("drop files", "to attach"),
+			].join("\n");
+			this.builtInHeader = new Text(`${logo}\n${instructions}`, 1, 0);
 
-		// Setup UI layout
-		this.ui.addChild(new Spacer(1));
-		this.ui.addChild(this.builtInHeader);
-		this.ui.addChild(new Spacer(1));
+			// Setup UI layout
+			this.ui.addChild(new Spacer(1));
+			this.ui.addChild(this.builtInHeader);
+			this.ui.addChild(new Spacer(1));
 
-		// Add changelog if provided
-		if (this.changelogMarkdown) {
-			this.ui.addChild(new DynamicBorder());
-			if (this.settingsManager.getCollapseChangelog()) {
+			// Add changelog if provided
+			if (this.changelogMarkdown) {
+				this.ui.addChild(new DynamicBorder());
+				if (this.settingsManager.getCollapseChangelog()) {
+					const versionMatch = this.changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
+					const latestVersion = versionMatch ? versionMatch[1] : this.version;
+					const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
+					this.ui.addChild(new Text(condensedText, 1, 0));
+				} else {
+					this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+					this.ui.addChild(new Spacer(1));
+					this.ui.addChild(new Markdown(this.changelogMarkdown.trim(), 1, 0, this.getMarkdownThemeWithSettings()));
+					this.ui.addChild(new Spacer(1));
+				}
+				this.ui.addChild(new DynamicBorder());
+			}
+		} else {
+			// Minimal header when silenced
+			this.builtInHeader = new Text("", 0, 0);
+			if (this.changelogMarkdown) {
+				// Still show changelog notification even in silent mode
+				this.ui.addChild(new Spacer(1));
 				const versionMatch = this.changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
 				const latestVersion = versionMatch ? versionMatch[1] : this.version;
 				const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
 				this.ui.addChild(new Text(condensedText, 1, 0));
-			} else {
-				this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-				this.ui.addChild(new Spacer(1));
-				this.ui.addChild(new Markdown(this.changelogMarkdown.trim(), 1, 0, getMarkdownTheme()));
-				this.ui.addChild(new Spacer(1));
 			}
-			this.ui.addChild(new DynamicBorder());
 		}
 
 		this.ui.addChild(this.chatContainer);
 		this.ui.addChild(this.pendingMessagesContainer);
 		this.ui.addChild(this.statusContainer);
-		this.ui.addChild(this.widgetContainer);
 		this.renderWidgets(); // Initialize with default spacer
+		this.ui.addChild(this.widgetContainerAbove);
 		this.ui.addChild(this.editorContainer);
+		this.ui.addChild(this.widgetContainerBelow);
 		this.ui.addChild(this.footer);
 		this.ui.setFocus(this.editor);
 
@@ -426,8 +454,7 @@ export class InteractiveMode {
 		this.isInitialized = true;
 
 		// Set terminal title
-		const cwdBasename = path.basename(process.cwd());
-		this.ui.terminal.setTitle(`pi - ${cwdBasename}`);
+		this.updateTerminalTitle();
 
 		// Initialize extensions with TUI-based UI context
 		await this.initExtensions();
@@ -446,6 +473,19 @@ export class InteractiveMode {
 		this.footerDataProvider.onBranchChange(() => {
 			this.ui.requestRender();
 		});
+	}
+
+	/**
+	 * Update terminal title with session name and cwd.
+	 */
+	private updateTerminalTitle(): void {
+		const cwdBasename = path.basename(process.cwd());
+		const sessionName = this.sessionManager.getSessionName();
+		if (sessionName) {
+			this.ui.terminal.setTitle(`π - ${sessionName} - ${cwdBasename}`);
+		} else {
+			this.ui.terminal.setTitle(`π - ${cwdBasename}`);
+		}
 	}
 
 	/**
@@ -565,39 +605,70 @@ export class InteractiveMode {
 		return undefined;
 	}
 
+	private getMarkdownThemeWithSettings(): MarkdownTheme {
+		return {
+			...getMarkdownTheme(),
+			codeBlockIndent: this.settingsManager.getCodeBlockIndent(),
+		};
+	}
+
 	// =========================================================================
 	// Extension System
 	// =========================================================================
 
-	/**
-	 * Initialize the extension system with TUI-based UI context.
-	 */
-	private async initExtensions(): Promise<void> {
-		// Show loaded project context files
-		const contextFiles = loadProjectContextFiles();
+	private formatDisplayPath(p: string): string {
+		const home = os.homedir();
+		let result = p;
+
+		// Shorten temp npm paths: /tmp/.../npm/.../node_modules/pkg/... -> npm:pkg/... (temp)
+		const npmTempMatch = result.match(/pi-extensions\/npm\/[^/]+\/node_modules\/([^/]+)(.*)/);
+		if (npmTempMatch) {
+			return `npm:${npmTempMatch[1]}${npmTempMatch[2]} (temp)`;
+		}
+
+		// Shorten temp git paths: /tmp/.../git-host/hash/path/... -> git:host/path/... (temp)
+		const gitTempMatch = result.match(/pi-extensions\/git-([^/]+)\/[^/]+\/(.*)/);
+		if (gitTempMatch) {
+			return `git:${gitTempMatch[1]}/${gitTempMatch[2]} (temp)`;
+		}
+
+		// Replace home directory with ~
+		if (result.startsWith(home)) {
+			result = `~${result.slice(home.length)}`;
+		}
+
+		return result;
+	}
+
+	private showLoadedResources(options?: { extensionPaths?: string[]; force?: boolean }): void {
+		const shouldShow = options?.force || !this.settingsManager.getQuietStartup();
+		if (!shouldShow) {
+			return;
+		}
+
+		const contextFiles = this.session.resourceLoader.getAgentsFiles().agentsFiles;
 		if (contextFiles.length > 0) {
-			const contextList = contextFiles.map((f) => theme.fg("dim", `  ${f.path}`)).join("\n");
+			const contextList = contextFiles.map((f) => theme.fg("dim", `  ${this.formatDisplayPath(f.path)}`)).join("\n");
 			this.chatContainer.addChild(new Text(theme.fg("muted", "Loaded context:\n") + contextList, 0, 0));
 			this.chatContainer.addChild(new Spacer(1));
 		}
 
-		// Show loaded skills (already discovered by SDK)
 		const skills = this.session.skills;
 		if (skills.length > 0) {
-			const skillList = skills.map((s) => theme.fg("dim", `  ${s.filePath}`)).join("\n");
+			const skillList = skills.map((s) => theme.fg("dim", `  ${this.formatDisplayPath(s.filePath)}`)).join("\n");
 			this.chatContainer.addChild(new Text(theme.fg("muted", "Loaded skills:\n") + skillList, 0, 0));
 			this.chatContainer.addChild(new Spacer(1));
 		}
 
-		// Show skill warnings if any
 		const skillWarnings = this.session.skillWarnings;
 		if (skillWarnings.length > 0) {
-			const warningList = skillWarnings.map((w) => theme.fg("warning", `  ${w.skillPath}: ${w.message}`)).join("\n");
+			const warningList = skillWarnings
+				.map((w) => theme.fg("warning", `  ${this.formatDisplayPath(w.skillPath)}: ${w.message}`))
+				.join("\n");
 			this.chatContainer.addChild(new Text(theme.fg("warning", "Skill warnings:\n") + warningList, 0, 0));
 			this.chatContainer.addChild(new Spacer(1));
 		}
 
-		// Show loaded prompt templates
 		const templates = this.session.promptTemplates;
 		if (templates.length > 0) {
 			const templateList = templates.map((t) => theme.fg("dim", `  /${t.name} ${t.source}`)).join("\n");
@@ -605,74 +676,29 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Spacer(1));
 		}
 
+		const extensionPaths = options?.extensionPaths ?? [];
+		if (extensionPaths.length > 0) {
+			const extList = extensionPaths.map((p) => theme.fg("dim", `  ${this.formatDisplayPath(p)}`)).join("\n");
+			this.chatContainer.addChild(new Text(theme.fg("muted", "Loaded extensions:\n") + extList, 0, 0));
+			this.chatContainer.addChild(new Spacer(1));
+		}
+	}
+
+	/**
+	 * Initialize the extension system with TUI-based UI context.
+	 */
+	private async initExtensions(): Promise<void> {
 		const extensionRunner = this.session.extensionRunner;
 		if (!extensionRunner) {
-			return; // No extensions loaded
+			this.showLoadedResources({ extensionPaths: [], force: false });
+			return;
 		}
 
 		// Create extension UI context
 		const uiContext = this.createExtensionUIContext();
-
-		extensionRunner.initialize(
-			// ExtensionActions - for pi.* API
-			{
-				sendMessage: (message, options) => {
-					const wasStreaming = this.session.isStreaming;
-					this.session
-						.sendCustomMessage(message, options)
-						.then(() => {
-							// Don't rebuild if initial render hasn't happened yet
-							// (renderInitialMessages will handle it)
-							if (!wasStreaming && message.display && this.hasRenderedInitialMessages) {
-								this.rebuildChatFromMessages();
-							}
-						})
-						.catch((err) => {
-							this.showError(
-								`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-							);
-						});
-				},
-				sendUserMessage: (content, options) => {
-					this.session.sendUserMessage(content, options).catch((err) => {
-						this.showError(
-							`Extension sendUserMessage failed: ${err instanceof Error ? err.message : String(err)}`,
-						);
-					});
-				},
-				appendEntry: (customType, data) => {
-					this.sessionManager.appendCustomEntry(customType, data);
-				},
-				setSessionName: (name) => {
-					this.sessionManager.appendSessionInfo(name);
-				},
-				getSessionName: () => {
-					return this.sessionManager.getSessionName();
-				},
-				getActiveTools: () => this.session.getActiveToolNames(),
-				getAllTools: () => this.session.getAllTools(),
-				setActiveTools: (toolNames) => this.session.setActiveToolsByName(toolNames),
-				setModel: async (model) => {
-					const key = await this.session.modelRegistry.getApiKey(model);
-					if (!key) return false;
-					await this.session.setModel(model);
-					return true;
-				},
-				getThinkingLevel: () => this.session.thinkingLevel,
-				setThinkingLevel: (level) => this.session.setThinkingLevel(level),
-			},
-			// ExtensionContextActions - for ctx.* in event handlers
-			{
-				getModel: () => this.session.model,
-				isIdle: () => !this.session.isStreaming,
-				abort: () => this.session.abort(),
-				hasPendingMessages: () => this.session.pendingMessageCount > 0,
-				shutdown: () => {
-					this.shutdownRequested = true;
-				},
-			},
-			// ExtensionCommandContextActions - for ctx.* in command handlers
-			{
+		await this.session.bindExtensions({
+			uiContext,
+			commandContextActions: {
 				waitForIdle: () => this.session.agent.waitForIdle(),
 				newSession: async (options) => {
 					if (this.loadingAnimation) {
@@ -717,7 +743,12 @@ export class InteractiveMode {
 					return { cancelled: false };
 				},
 				navigateTree: async (targetId, options) => {
-					const result = await this.session.navigateTree(targetId, { summarize: options?.summarize });
+					const result = await this.session.navigateTree(targetId, {
+						summarize: options?.summarize,
+						customInstructions: options?.customInstructions,
+						replaceInstructions: options?.replaceInstructions,
+						label: options?.label,
+					});
 					if (result.cancelled) {
 						return { cancelled: true };
 					}
@@ -732,29 +763,16 @@ export class InteractiveMode {
 					return { cancelled: false };
 				},
 			},
-			uiContext,
-		);
-
-		// Subscribe to extension errors
-		extensionRunner.onError((error) => {
-			this.showExtensionError(error.extensionPath, error.error, error.stack);
+			shutdownHandler: () => {
+				this.shutdownRequested = true;
+			},
+			onError: (error) => {
+				this.showExtensionError(error.extensionPath, error.error, error.stack);
+			},
 		});
 
-		// Set up extension-registered shortcuts
 		this.setupExtensionShortcuts(extensionRunner);
-
-		// Show loaded extensions
-		const extensionPaths = extensionRunner.getExtensionPaths();
-		if (extensionPaths.length > 0) {
-			const extList = extensionPaths.map((p) => theme.fg("dim", `  ${p}`)).join("\n");
-			this.chatContainer.addChild(new Text(theme.fg("muted", "Loaded extensions:\n") + extList, 0, 0));
-			this.chatContainer.addChild(new Spacer(1));
-		}
-
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
-		});
+		this.showLoadedResources({ extensionPaths: extensionRunner.getExtensionPaths(), force: false });
 	}
 
 	/**
@@ -770,7 +788,7 @@ export class InteractiveMode {
 	 * Set up keyboard shortcuts registered by extensions.
 	 */
 	private setupExtensionShortcuts(extensionRunner: ExtensionRunner): void {
-		const shortcuts = extensionRunner.getShortcuts();
+		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
 		if (shortcuts.size === 0) return;
 
 		// Create a context for shortcut handlers
@@ -786,6 +804,20 @@ export class InteractiveMode {
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
 				this.shutdownRequested = true;
+			},
+			getContextUsage: () => this.session.getContextUsage(),
+			compact: (options) => {
+				void (async () => {
+					try {
+						const result = await this.executeCompaction(options?.customInstructions, false);
+						if (result) {
+							options?.onComplete?.(result);
+						}
+					} catch (error) {
+						const err = error instanceof Error ? error : new Error(String(error));
+						options?.onError?.(err);
+					}
+				})();
 			},
 		});
 
@@ -819,14 +851,26 @@ export class InteractiveMode {
 	private setExtensionWidget(
 		key: string,
 		content: string[] | ((tui: TUI, thm: Theme) => Component & { dispose?(): void }) | undefined,
+		options?: ExtensionWidgetOptions,
 	): void {
-		// Dispose and remove existing widget
-		const existing = this.extensionWidgets.get(key);
-		if (existing?.dispose) existing.dispose();
+		const placement = options?.placement ?? "aboveEditor";
+		const removeExisting = (map: Map<string, Component & { dispose?(): void }>) => {
+			const existing = map.get(key);
+			if (existing?.dispose) existing.dispose();
+			map.delete(key);
+		};
+
+		removeExisting(this.extensionWidgetsAbove);
+		removeExisting(this.extensionWidgetsBelow);
 
 		if (content === undefined) {
-			this.extensionWidgets.delete(key);
-		} else if (Array.isArray(content)) {
+			this.renderWidgets();
+			return;
+		}
+
+		let component: Component & { dispose?(): void };
+
+		if (Array.isArray(content)) {
 			// Wrap string array in a Container with Text components
 			const container = new Container();
 			for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) {
@@ -835,13 +879,47 @@ export class InteractiveMode {
 			if (content.length > InteractiveMode.MAX_WIDGET_LINES) {
 				container.addChild(new Text(theme.fg("muted", "... (widget truncated)"), 1, 0));
 			}
-			this.extensionWidgets.set(key, container);
+			component = container;
 		} else {
 			// Factory function - create component
-			const component = content(this.ui, theme);
-			this.extensionWidgets.set(key, component);
+			component = content(this.ui, theme);
 		}
+
+		const targetMap = placement === "belowEditor" ? this.extensionWidgetsBelow : this.extensionWidgetsAbove;
+		targetMap.set(key, component);
 		this.renderWidgets();
+	}
+
+	private clearExtensionWidgets(): void {
+		for (const widget of this.extensionWidgetsAbove.values()) {
+			widget.dispose?.();
+		}
+		for (const widget of this.extensionWidgetsBelow.values()) {
+			widget.dispose?.();
+		}
+		this.extensionWidgetsAbove.clear();
+		this.extensionWidgetsBelow.clear();
+		this.renderWidgets();
+	}
+
+	private resetExtensionUI(): void {
+		if (this.extensionSelector) {
+			this.hideExtensionSelector();
+		}
+		if (this.extensionInput) {
+			this.hideExtensionInput();
+		}
+		if (this.extensionEditor) {
+			this.hideExtensionEditor();
+		}
+		this.ui.hideOverlay();
+		this.setExtensionFooter(undefined);
+		this.setExtensionHeader(undefined);
+		this.clearExtensionWidgets();
+		this.footerDataProvider.clearExtensionStatuses();
+		this.footer.invalidate();
+		this.setCustomEditorComponent(undefined);
+		this.defaultEditor.onExtensionShortcut = undefined;
 	}
 
 	// Maximum total widget lines to prevent viewport overflow
@@ -851,21 +929,33 @@ export class InteractiveMode {
 	 * Render all extension widgets to the widget container.
 	 */
 	private renderWidgets(): void {
-		if (!this.widgetContainer) return;
-		this.widgetContainer.clear();
+		if (!this.widgetContainerAbove || !this.widgetContainerBelow) return;
+		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true);
+		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false, false);
+		this.ui.requestRender();
+	}
 
-		if (this.extensionWidgets.size === 0) {
-			this.widgetContainer.addChild(new Spacer(1));
-			this.ui.requestRender();
+	private renderWidgetContainer(
+		container: Container,
+		widgets: Map<string, Component & { dispose?(): void }>,
+		spacerWhenEmpty: boolean,
+		leadingSpacer: boolean,
+	): void {
+		container.clear();
+
+		if (widgets.size === 0) {
+			if (spacerWhenEmpty) {
+				container.addChild(new Spacer(1));
+			}
 			return;
 		}
 
-		this.widgetContainer.addChild(new Spacer(1));
-		for (const [_key, component] of this.extensionWidgets) {
-			this.widgetContainer.addChild(component);
+		if (leadingSpacer) {
+			container.addChild(new Spacer(1));
 		}
-
-		this.ui.requestRender();
+		for (const component of widgets.values()) {
+			container.addChild(component);
+		}
 	}
 
 	/**
@@ -956,7 +1046,7 @@ export class InteractiveMode {
 					}
 				}
 			},
-			setWidget: (key, content) => this.setExtensionWidget(key, content),
+			setWidget: (key, content, options) => this.setExtensionWidget(key, content, options),
 			setFooter: (factory) => this.setExtensionFooter(factory),
 			setHeader: (factory) => this.setExtensionHeader(factory),
 			setTitle: (title) => this.ui.terminal.setTitle(title),
@@ -1490,6 +1580,11 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/reload") {
+				this.editor.setText("");
+				await this.handleReloadCommand();
+				return;
+			}
 			if (text === "/debug") {
 				this.handleDebugCommand();
 				this.editor.setText("");
@@ -1611,7 +1706,11 @@ export class InteractiveMode {
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
-					this.streamingComponent = new AssistantMessageComponent(undefined, this.hideThinkingBlock);
+					this.streamingComponent = new AssistantMessageComponent(
+						undefined,
+						this.hideThinkingBlock,
+						this.getMarkdownThemeWithSettings(),
+					);
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
 					this.streamingComponent.updateContent(this.streamingMessage);
@@ -1795,6 +1894,10 @@ export class InteractiveMode {
 						timestamp: Date.now(),
 					});
 					this.footer.invalidate();
+				} else if (event.errorMessage) {
+					// Compaction failed (e.g., quota exceeded, API error)
+					this.chatContainer.addChild(new Spacer(1));
+					this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
 				}
 				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
@@ -1898,20 +2001,22 @@ export class InteractiveMode {
 			case "custom": {
 				if (message.display) {
 					const renderer = this.session.extensionRunner?.getMessageRenderer(message.customType);
-					this.chatContainer.addChild(new CustomMessageComponent(message, renderer));
+					this.chatContainer.addChild(
+						new CustomMessageComponent(message, renderer, this.getMarkdownThemeWithSettings()),
+					);
 				}
 				break;
 			}
 			case "compactionSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message);
+				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
 			}
 			case "branchSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new BranchSummaryMessageComponent(message);
+				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
@@ -1919,7 +2024,7 @@ export class InteractiveMode {
 			case "user": {
 				const textContent = this.getUserMessageText(message);
 				if (textContent) {
-					const userComponent = new UserMessageComponent(textContent);
+					const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings());
 					this.chatContainer.addChild(userComponent);
 					if (options?.populateHistory) {
 						this.editor.addToHistory?.(textContent);
@@ -1928,7 +2033,11 @@ export class InteractiveMode {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(message, this.hideThinkingBlock);
+				const assistantComponent = new AssistantMessageComponent(
+					message,
+					this.hideThinkingBlock,
+					this.getMarkdownThemeWithSettings(),
+				);
 				this.chatContainer.addChild(assistantComponent);
 				break;
 			}
@@ -2011,7 +2120,6 @@ export class InteractiveMode {
 	}
 
 	renderInitialMessages(): void {
-		this.hasRenderedInitialMessages = true;
 		// Get aligned messages and entries from session context
 		const context = this.sessionManager.buildSessionContext();
 		this.renderSessionContext(context, {
@@ -2491,6 +2599,9 @@ export class InteractiveMode {
 					hideThinkingBlock: this.hideThinkingBlock,
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
 					doubleEscapeAction: this.settingsManager.getDoubleEscapeAction(),
+					showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
+					editorPaddingX: this.settingsManager.getEditorPaddingX(),
+					quietStartup: this.settingsManager.getQuietStartup(),
 				},
 				{
 					onAutoCompactChange: (enabled) => {
@@ -2555,8 +2666,19 @@ export class InteractiveMode {
 					onCollapseChangelogChange: (collapsed) => {
 						this.settingsManager.setCollapseChangelog(collapsed);
 					},
+					onQuietStartupChange: (enabled) => {
+						this.settingsManager.setQuietStartup(enabled);
+					},
 					onDoubleEscapeActionChange: (action) => {
 						this.settingsManager.setDoubleEscapeAction(action);
+					},
+					onShowHardwareCursorChange: (enabled) => {
+						this.settingsManager.setShowHardwareCursor(enabled);
+						this.ui.setShowHardwareCursor(enabled);
+					},
+					onEditorPaddingXChange: (padding) => {
+						this.settingsManager.setEditorPaddingX(padding);
+						this.defaultEditor.setPaddingX(padding);
 					},
 					onCancel: () => {
 						done();
@@ -2963,6 +3085,7 @@ export class InteractiveMode {
 					void this.shutdown();
 				},
 				() => this.ui.requestRender(),
+				this.sessionManager.getSessionFile(),
 			);
 			return { component: selector, focus: selector.getSessionList() };
 		});
@@ -3129,6 +3252,53 @@ export class InteractiveMode {
 	// Command handlers
 	// =========================================================================
 
+	private async handleReloadCommand(): Promise<void> {
+		if (this.session.isStreaming) {
+			this.showWarning("Wait for the current response to finish before reloading.");
+			return;
+		}
+		if (this.session.isCompacting) {
+			this.showWarning("Wait for compaction to finish before reloading.");
+			return;
+		}
+
+		this.resetExtensionUI();
+
+		const loader = new BorderedLoader(this.ui, theme, "Reloading resources...", { cancellable: false });
+		const previousEditor = this.editor;
+		this.editorContainer.clear();
+		this.editorContainer.addChild(loader);
+		this.ui.setFocus(loader);
+		this.ui.requestRender();
+
+		const restoreEditor = () => {
+			loader.dispose();
+			this.editorContainer.clear();
+			this.editorContainer.addChild(previousEditor);
+			this.ui.setFocus(previousEditor as Component);
+			this.ui.requestRender();
+		};
+
+		try {
+			await this.session.reload();
+			this.rebuildAutocomplete();
+			const runner = this.session.extensionRunner;
+			if (runner) {
+				this.setupExtensionShortcuts(runner);
+			}
+			restoreEditor();
+			this.showLoadedResources({ extensionPaths: runner?.getExtensionPaths() ?? [], force: true });
+			const modelsJsonError = this.session.modelRegistry.getError();
+			if (modelsJsonError) {
+				this.showError(`models.json error: ${modelsJsonError}`);
+			}
+			this.showStatus("Reloaded resources");
+		} catch (error) {
+			restoreEditor();
+			this.showError(`Reload failed: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	private async handleExportCommand(text: string): Promise<void> {
 		const parts = text.split(/\s+/);
 		const outputPath = parts.length > 1 ? parts[1] : undefined;
@@ -3225,7 +3395,7 @@ export class InteractiveMode {
 			}
 
 			// Create the preview URL
-			const previewUrl = `https://buildwithpi.ai/session?${gistId}`;
+			const previewUrl = getShareViewerUrl(gistId);
 			this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
 		} catch (error: unknown) {
 			if (!loader.signal.aborted) {
@@ -3265,6 +3435,7 @@ export class InteractiveMode {
 		}
 
 		this.sessionManager.appendSessionInfo(name);
+		this.updateTerminalTitle();
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0));
 		this.ui.requestRender();
@@ -3323,7 +3494,7 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new DynamicBorder());
 		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, getMarkdownTheme()));
+		this.chatContainer.addChild(new Markdown(changelogMarkdown, 1, 1, this.getMarkdownThemeWithSettings()));
 		this.chatContainer.addChild(new DynamicBorder());
 		this.ui.requestRender();
 	}
@@ -3368,8 +3539,12 @@ export class InteractiveMode {
 		const submit = this.getEditorKeyDisplay("submit");
 		const newLine = this.getEditorKeyDisplay("newLine");
 		const deleteWordBackward = this.getEditorKeyDisplay("deleteWordBackward");
+		const deleteWordForward = this.getEditorKeyDisplay("deleteWordForward");
 		const deleteToLineStart = this.getEditorKeyDisplay("deleteToLineStart");
 		const deleteToLineEnd = this.getEditorKeyDisplay("deleteToLineEnd");
+		const yank = this.getEditorKeyDisplay("yank");
+		const yankPop = this.getEditorKeyDisplay("yankPop");
+		const undo = this.getEditorKeyDisplay("undo");
 		const tab = this.getEditorKeyDisplay("tab");
 
 		// App keybindings
@@ -3400,8 +3575,12 @@ export class InteractiveMode {
 | \`${submit}\` | Send message |
 | \`${newLine}\` | New line${process.platform === "win32" ? " (Ctrl+Enter on Windows Terminal)" : ""} |
 | \`${deleteWordBackward}\` | Delete word backwards |
+| \`${deleteWordForward}\` | Delete word forwards |
 | \`${deleteToLineStart}\` | Delete to start of line |
 | \`${deleteToLineEnd}\` | Delete to end of line |
+| \`${yank}\` | Paste the most-recently-deleted text |
+| \`${yankPop}\` | Cycle through the deleted text after pasting |
+| \`${undo}\` | Undo |
 
 **Other**
 | Key | Action |
@@ -3427,7 +3606,7 @@ export class InteractiveMode {
 		// Add extension-registered shortcuts
 		const extensionRunner = this.session.extensionRunner;
 		if (extensionRunner) {
-			const shortcuts = extensionRunner.getShortcuts();
+			const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
 			if (shortcuts.size > 0) {
 				hotkeys += `
 **Extensions**
@@ -3445,7 +3624,7 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new DynamicBorder());
 		this.chatContainer.addChild(new Text(theme.bold(theme.fg("accent", "Keyboard Shortcuts")), 1, 0));
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, getMarkdownTheme()));
+		this.chatContainer.addChild(new Markdown(hotkeys.trim(), 1, 1, this.getMarkdownThemeWithSettings()));
 		this.chatContainer.addChild(new DynamicBorder());
 		this.ui.requestRender();
 	}
@@ -3476,12 +3655,13 @@ export class InteractiveMode {
 
 	private handleDebugCommand(): void {
 		const width = this.ui.terminal.columns;
+		const height = this.ui.terminal.rows;
 		const allLines = this.ui.render(width);
 
 		const debugLogPath = getDebugLogPath();
 		const debugData = [
 			`Debug output at ${new Date().toISOString()}`,
-			`Terminal width: ${width}`,
+			`Terminal: ${width}x${height}`,
 			`Total lines: ${allLines.length}`,
 			"",
 			"=== All rendered lines with visible widths ===",
@@ -3613,7 +3793,7 @@ export class InteractiveMode {
 		await this.executeCompaction(customInstructions, false);
 	}
 
-	private async executeCompaction(customInstructions?: string, isAuto = false): Promise<void> {
+	private async executeCompaction(customInstructions?: string, isAuto = false): Promise<CompactionResult | undefined> {
 		// Stop loading animation
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
@@ -3640,8 +3820,10 @@ export class InteractiveMode {
 		this.statusContainer.addChild(compactingLoader);
 		this.ui.requestRender();
 
+		let result: CompactionResult | undefined;
+
 		try {
-			const result = await this.session.compact(customInstructions);
+			result = await this.session.compact(customInstructions);
 
 			// Rebuild UI
 			this.rebuildChatFromMessages();
@@ -3664,6 +3846,7 @@ export class InteractiveMode {
 			this.defaultEditor.onEscape = originalOnEscape;
 		}
 		void this.flushCompactionQueue({ willRetry: false });
+		return result;
 	}
 
 	stop(): void {

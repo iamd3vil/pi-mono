@@ -35,53 +35,11 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			console.log(JSON.stringify(header));
 		}
 	}
-	// Set up extensions for print mode (no UI, no command context)
+	// Set up extensions for print mode (no UI)
 	const extensionRunner = session.extensionRunner;
 	if (extensionRunner) {
-		extensionRunner.initialize(
-			// ExtensionActions
-			{
-				sendMessage: (message, options) => {
-					session.sendCustomMessage(message, options).catch((e) => {
-						console.error(`Extension sendMessage failed: ${e instanceof Error ? e.message : String(e)}`);
-					});
-				},
-				sendUserMessage: (content, options) => {
-					session.sendUserMessage(content, options).catch((e) => {
-						console.error(`Extension sendUserMessage failed: ${e instanceof Error ? e.message : String(e)}`);
-					});
-				},
-				appendEntry: (customType, data) => {
-					session.sessionManager.appendCustomEntry(customType, data);
-				},
-				setSessionName: (name) => {
-					session.sessionManager.appendSessionInfo(name);
-				},
-				getSessionName: () => {
-					return session.sessionManager.getSessionName();
-				},
-				getActiveTools: () => session.getActiveToolNames(),
-				getAllTools: () => session.getAllTools(),
-				setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
-				setModel: async (model) => {
-					const key = await session.modelRegistry.getApiKey(model);
-					if (!key) return false;
-					await session.setModel(model);
-					return true;
-				},
-				getThinkingLevel: () => session.thinkingLevel,
-				setThinkingLevel: (level) => session.setThinkingLevel(level),
-			},
-			// ExtensionContextActions
-			{
-				getModel: () => session.model,
-				isIdle: () => !session.isStreaming,
-				abort: () => session.abort(),
-				hasPendingMessages: () => session.pendingMessageCount > 0,
-				shutdown: () => {},
-			},
-			// ExtensionCommandContextActions - commands invokable via prompt("/command")
-			{
+		await session.bindExtensions({
+			commandContextActions: {
 				waitForIdle: () => session.agent.waitForIdle(),
 				newSession: async (options) => {
 					const success = await session.newSession({ parentSession: options?.parentSession });
@@ -95,18 +53,18 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 					return { cancelled: result.cancelled };
 				},
 				navigateTree: async (targetId, options) => {
-					const result = await session.navigateTree(targetId, { summarize: options?.summarize });
+					const result = await session.navigateTree(targetId, {
+						summarize: options?.summarize,
+						customInstructions: options?.customInstructions,
+						replaceInstructions: options?.replaceInstructions,
+						label: options?.label,
+					});
 					return { cancelled: result.cancelled };
 				},
 			},
-			// No UI context - hasUI will be false
-		);
-		extensionRunner.onError((err) => {
-			console.error(`Extension error (${err.extensionPath}): ${err.error}`);
-		});
-		// Emit session_start event
-		await extensionRunner.emit({
-			type: "session_start",
+			onError: (err) => {
+				console.error(`Extension error (${err.extensionPath}): ${err.error}`);
+			},
 		});
 	}
 

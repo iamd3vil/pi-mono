@@ -1,7 +1,7 @@
 // Core session management
 
 // Config paths
-export { getAgentDir } from "./config.js";
+export { getAgentDir, VERSION } from "./config.js";
 export {
 	AgentSession,
 	type AgentSessionConfig,
@@ -45,7 +45,9 @@ export type {
 	AgentToolUpdateCallback,
 	AppAction,
 	BeforeAgentStartEvent,
+	CompactOptions,
 	ContextEvent,
+	ContextUsage,
 	ExecOptions,
 	ExecResult,
 	Extension,
@@ -64,6 +66,7 @@ export type {
 	ExtensionShortcut,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
+	ExtensionWidgetOptions,
 	InputEvent,
 	InputEventResult,
 	InputSource,
@@ -92,8 +95,10 @@ export type {
 	TurnStartEvent,
 	UserBashEvent,
 	UserBashEventResult,
+	WidgetPlacement,
 } from "./core/extensions/index.js";
 export {
+	createExtensionRuntime,
 	ExtensionRunner,
 	isBashToolResult,
 	isEditToolResult,
@@ -111,10 +116,12 @@ export {
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.js";
 export { convertToLlm } from "./core/messages.js";
 export { ModelRegistry } from "./core/model-registry.js";
+export type { PackageManager, ProgressCallback, ProgressEvent } from "./core/package-manager.js";
+export { DefaultPackageManager } from "./core/package-manager.js";
+export type { ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.js";
+export { DefaultResourceLoader } from "./core/resource-loader.js";
 // SDK for programmatic usage
 export {
-	type BuildSystemPromptOptions,
-	buildSystemPrompt,
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 	// Factory
@@ -129,14 +136,6 @@ export {
 	createReadOnlyTools,
 	createReadTool,
 	createWriteTool,
-	// Discovery
-	discoverAuthStorage,
-	discoverContextFiles,
-	discoverExtensions,
-	discoverModels,
-	discoverPromptTemplates,
-	discoverSkills,
-	loadSettings,
 	type PromptTemplate,
 	// Pre-built tools (use process.cwd())
 	readOnlyTools,
@@ -168,9 +167,7 @@ export {
 	type CompactionSettings,
 	type ImageSettings,
 	type RetrySettings,
-	type Settings,
 	SettingsManager,
-	type SkillsSettings,
 } from "./core/settings-manager.js";
 // Skills
 export {
@@ -237,6 +234,8 @@ export {
 export {
 	ArminComponent,
 	AssistantMessageComponent,
+	appKey,
+	appKeyHint,
 	BashExecutionComponent,
 	BorderedLoader,
 	BranchSummaryMessageComponent,
@@ -247,11 +246,14 @@ export {
 	ExtensionEditorComponent,
 	ExtensionInputComponent,
 	ExtensionSelectorComponent,
+	editorKey,
 	FooterComponent,
+	keyHint,
 	LoginDialogComponent,
 	ModelSelectorComponent,
 	OAuthSelectorComponent,
 	type RenderDiffOptions,
+	rawKeyHint,
 	renderDiff,
 	SessionSelectorComponent,
 	type SettingsCallbacks,

@@ -33,36 +33,54 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	estimateContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
-import type {
+import {
+	type ContextUsage,
+	type ExtensionCommandContextActions,
+	type ExtensionErrorListener,
 	ExtensionRunner,
-	InputSource,
-	SessionBeforeCompactResult,
-	SessionBeforeForkResult,
-	SessionBeforeSwitchResult,
-	SessionBeforeTreeResult,
-	TreePreparation,
-	TurnEndEvent,
-	TurnStartEvent,
+	type ExtensionUIContext,
+	type InputSource,
+	type SessionBeforeCompactResult,
+	type SessionBeforeForkResult,
+	type SessionBeforeSwitchResult,
+	type SessionBeforeTreeResult,
+	type ShutdownHandler,
+	type ToolDefinition,
+	type TreePreparation,
+	type TurnEndEvent,
+	type TurnStartEvent,
+	wrapRegisteredTools,
+	wrapToolsWithExtensions,
 } from "./extensions/index.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import type { ResourceLoader } from "./resource-loader.js";
 import type { BranchSummaryEntry, CompactionEntry, NewSessionOptions, SessionManager } from "./session-manager.js";
-import type { SettingsManager, SkillsSettings } from "./settings-manager.js";
+import type { SettingsManager } from "./settings-manager.js";
 import type { Skill, SkillWarning } from "./skills.js";
+import { buildSystemPrompt } from "./system-prompt.js";
 import type { BashOperations } from "./tools/bash.js";
+import { createAllTools } from "./tools/index.js";
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
 	| { type: "auto_compaction_start"; reason: "threshold" | "overflow" }
-	| { type: "auto_compaction_end"; result: CompactionResult | undefined; aborted: boolean; willRetry: boolean }
+	| {
+			type: "auto_compaction_end";
+			result: CompactionResult | undefined;
+			aborted: boolean;
+			willRetry: boolean;
+			errorMessage?: string;
+	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 
@@ -77,23 +95,28 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
+	cwd: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel: ThinkingLevel }>;
-	/** File-based prompt templates for expansion */
-	promptTemplates?: PromptTemplate[];
-	/** Extension runner (created in sdk.ts with wrapped tools) */
-	extensionRunner?: ExtensionRunner;
-	/** Loaded skills (already discovered by SDK) */
-	skills?: Skill[];
-	/** Skill loading warnings (already captured by SDK) */
-	skillWarnings?: SkillWarning[];
-	skillsSettings?: Required<SkillsSettings>;
+	/** Resource loader for skills, prompts, themes, context files, system prompt */
+	resourceLoader: ResourceLoader;
+	/** SDK custom tools registered outside extensions */
+	customTools?: ToolDefinition[];
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
-	/** Tool registry for extension getTools/setTools - maps name to tool */
-	toolRegistry?: Map<string, AgentTool>;
-	/** Function to rebuild system prompt when tools change */
-	rebuildSystemPrompt?: (toolNames: string[]) => string;
+	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
+	initialActiveToolNames?: string[];
+	/** Override base tools (useful for custom runtimes). */
+	baseToolsOverride?: Record<string, AgentTool>;
+	/** Mutable ref used by Agent to access the current ExtensionRunner */
+	extensionRunnerRef?: { current?: ExtensionRunner };
+}
+
+export interface ExtensionBindings {
+	uiContext?: ExtensionUIContext;
+	commandContextActions?: ExtensionCommandContextActions;
+	shutdownHandler?: ShutdownHandler;
+	onError?: ExtensionErrorListener;
 }
 
 /** Options for AgentSession.prompt() */
@@ -155,7 +178,6 @@ export class AgentSession {
 	readonly settingsManager: SettingsManager;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel: ThinkingLevel }>;
-	private _promptTemplates: PromptTemplate[];
 
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
@@ -189,40 +211,49 @@ export class AgentSession {
 	private _extensionRunner: ExtensionRunner | undefined = undefined;
 	private _turnIndex = 0;
 
-	private _skills: Skill[];
-	private _skillWarnings: SkillWarning[];
-	private _skillsSettings: Required<SkillsSettings> | undefined;
+	private _resourceLoader: ResourceLoader;
+	private _customTools: ToolDefinition[];
+	private _baseToolRegistry: Map<string, AgentTool> = new Map();
+	private _cwd: string;
+	private _extensionRunnerRef?: { current?: ExtensionRunner };
+	private _initialActiveToolNames?: string[];
+	private _baseToolsOverride?: Record<string, AgentTool>;
+	private _extensionUIContext?: ExtensionUIContext;
+	private _extensionCommandContextActions?: ExtensionCommandContextActions;
+	private _extensionShutdownHandler?: ShutdownHandler;
+	private _extensionErrorListeners = new Set<ExtensionErrorListener>();
+	private _extensionErrorUnsubscribers: Array<() => void> = [];
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
 
 	// Tool registry for extension getTools/setTools
-	private _toolRegistry: Map<string, AgentTool>;
-
-	// Function to rebuild system prompt when tools change
-	private _rebuildSystemPrompt?: (toolNames: string[]) => string;
+	private _toolRegistry: Map<string, AgentTool> = new Map();
 
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
-	private _baseSystemPrompt: string;
+	private _baseSystemPrompt = "";
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
-		this._promptTemplates = config.promptTemplates ?? [];
-		this._extensionRunner = config.extensionRunner;
-		this._skills = config.skills ?? [];
-		this._skillWarnings = config.skillWarnings ?? [];
-		this._skillsSettings = config.skillsSettings;
+		this._resourceLoader = config.resourceLoader;
+		this._customTools = config.customTools ?? [];
+		this._cwd = config.cwd;
 		this._modelRegistry = config.modelRegistry;
-		this._toolRegistry = config.toolRegistry ?? new Map();
-		this._rebuildSystemPrompt = config.rebuildSystemPrompt;
-		this._baseSystemPrompt = config.agent.state.systemPrompt;
+		this._extensionRunnerRef = config.extensionRunnerRef;
+		this._initialActiveToolNames = config.initialActiveToolNames;
+		this._baseToolsOverride = config.baseToolsOverride;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+
+		this._buildRuntime({
+			activeToolNames: this._initialActiveToolNames,
+			includeAllExtensionTools: true,
+		});
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -494,10 +525,8 @@ export class AgentSession {
 		this.agent.setTools(tools);
 
 		// Rebuild base system prompt with new tool set
-		if (this._rebuildSystemPrompt) {
-			this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
-			this.agent.setSystemPrompt(this._baseSystemPrompt);
-		}
+		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
+		this.agent.setSystemPrompt(this._baseSystemPrompt);
 	}
 
 	/** Whether auto-compaction is currently running */
@@ -542,7 +571,26 @@ export class AgentSession {
 
 	/** File-based prompt templates */
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
-		return this._promptTemplates;
+		return this._resourceLoader.getPrompts().prompts;
+	}
+
+	private _rebuildSystemPrompt(toolNames: string[]): string {
+		const validToolNames = toolNames.filter((name) => this._baseToolRegistry.has(name));
+		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
+		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
+		const appendSystemPrompt =
+			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
+		const loadedSkills = this._resourceLoader.getSkills().skills;
+		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+
+		return buildSystemPrompt({
+			cwd: this._cwd,
+			skills: loadedSkills,
+			contextFiles: loadedContextFiles,
+			customPrompt: loaderSystemPrompt,
+			appendSystemPrompt,
+			selectedTools: validToolNames,
+		});
 	}
 
 	// =========================================================================
@@ -593,7 +641,7 @@ export class AgentSession {
 		let expandedText = currentText;
 		if (expandPromptTemplates) {
 			expandedText = this._expandSkillCommand(expandedText);
-			expandedText = expandPromptTemplate(expandedText, [...this._promptTemplates]);
+			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 		}
 
 		// If streaming, queue via steer() or followUp() based on option
@@ -626,6 +674,14 @@ export class AgentSession {
 		// Validate API key
 		const apiKey = await this._modelRegistry.getApiKey(this.model);
 		if (!apiKey) {
+			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
+			if (isOAuth) {
+				throw new Error(
+					`Authentication failed for "${this.model.provider}". ` +
+						`Credentials may have expired or network is unavailable. ` +
+						`Run '/login ${this.model.provider}' to re-authenticate.`,
+				);
+			}
 			throw new Error(
 				`No API key found for ${this.model.provider}.\n\n` +
 					`Use /login, set an API key environment variable, or create ${getAuthPath()}`,
@@ -734,7 +790,7 @@ export class AgentSession {
 		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
 
-		const skill = this._skills.find((s) => s.name === skillName);
+		const skill = this.skills.find((s) => s.name === skillName);
 		if (!skill) return text; // Unknown skill, pass through
 
 		try {
@@ -768,7 +824,7 @@ export class AgentSession {
 
 		// Expand skill commands and prompt templates
 		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this._promptTemplates]);
+		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		await this._queueSteer(expandedText);
 	}
@@ -787,7 +843,7 @@ export class AgentSession {
 
 		// Expand skill commands and prompt templates
 		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this._promptTemplates]);
+		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		await this._queueFollowUp(expandedText);
 	}
@@ -875,6 +931,8 @@ export class AgentSession {
 				message.display,
 				message.details,
 			);
+			this._emit({ type: "message_start", message: appMessage });
+			this._emit({ type: "message_end", message: appMessage });
 		}
 	}
 
@@ -947,18 +1005,21 @@ export class AgentSession {
 		return this._followUpMessages;
 	}
 
-	get skillsSettings(): Required<SkillsSettings> | undefined {
-		return this._skillsSettings;
-	}
-
-	/** Skills loaded by SDK (empty if --no-skills or skills: [] was passed) */
+	/** Skills loaded by resource loader */
 	get skills(): readonly Skill[] {
-		return this._skills;
+		return this._resourceLoader.getSkills().skills;
 	}
 
-	/** Skill loading warnings captured by SDK */
+	/** Skill loading warnings captured by resource loader */
 	get skillWarnings(): readonly SkillWarning[] {
-		return this._skillWarnings;
+		return this._resourceLoader.getSkills().diagnostics.map((diagnostic) => ({
+			skillPath: diagnostic.path ?? "<unknown>",
+			message: diagnostic.message,
+		}));
+	}
+
+	get resourceLoader(): ResourceLoader {
+		return this._resourceLoader;
 	}
 
 	/**
@@ -1544,13 +1605,17 @@ export class AgentSession {
 				}, 100);
 			}
 		} catch (error) {
-			this._emit({ type: "auto_compaction_end", result: undefined, aborted: false, willRetry: false });
-
-			if (reason === "overflow") {
-				throw new Error(
-					`Context overflow: ${error instanceof Error ? error.message : "compaction failed"}. Your input may be too large for the context window.`,
-				);
-			}
+			const errorMessage = error instanceof Error ? error.message : "compaction failed";
+			this._emit({
+				type: "auto_compaction_end",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				errorMessage:
+					reason === "overflow"
+						? `Context overflow recovery failed: ${errorMessage}`
+						: `Auto-compaction failed: ${errorMessage}`,
+			});
 		} finally {
 			this._autoCompactionAbortController = undefined;
 		}
@@ -1566,6 +1631,219 @@ export class AgentSession {
 	/** Whether auto-compaction is enabled */
 	get autoCompactionEnabled(): boolean {
 		return this.settingsManager.getCompactionEnabled();
+	}
+
+	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		if (bindings.uiContext !== undefined) {
+			this._extensionUIContext = bindings.uiContext;
+		}
+		if (bindings.commandContextActions !== undefined) {
+			this._extensionCommandContextActions = bindings.commandContextActions;
+		}
+		if (bindings.shutdownHandler !== undefined) {
+			this._extensionShutdownHandler = bindings.shutdownHandler;
+		}
+		if (bindings.onError) {
+			this._extensionErrorListeners.add(bindings.onError);
+		}
+
+		if (this._extensionRunner) {
+			this._applyExtensionBindings(this._extensionRunner);
+			await this._extensionRunner.emit({ type: "session_start" });
+		}
+	}
+
+	private _applyExtensionBindings(runner: ExtensionRunner): void {
+		runner.setUIContext(this._extensionUIContext);
+		runner.bindCommandContext(this._extensionCommandContextActions);
+
+		for (const unsubscribe of this._extensionErrorUnsubscribers) {
+			unsubscribe();
+		}
+		this._extensionErrorUnsubscribers = [];
+		for (const listener of this._extensionErrorListeners) {
+			this._extensionErrorUnsubscribers.push(runner.onError(listener));
+		}
+	}
+
+	private _bindExtensionCore(runner: ExtensionRunner): void {
+		runner.bindCore(
+			{
+				sendMessage: (message, options) => {
+					this.sendCustomMessage(message, options).catch((err) => {
+						runner.emitError({
+							extensionPath: "<runtime>",
+							event: "send_message",
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
+				},
+				sendUserMessage: (content, options) => {
+					this.sendUserMessage(content, options).catch((err) => {
+						runner.emitError({
+							extensionPath: "<runtime>",
+							event: "send_user_message",
+							error: err instanceof Error ? err.message : String(err),
+						});
+					});
+				},
+				appendEntry: (customType, data) => {
+					this.sessionManager.appendCustomEntry(customType, data);
+				},
+				setSessionName: (name) => {
+					this.sessionManager.appendSessionInfo(name);
+				},
+				getSessionName: () => {
+					return this.sessionManager.getSessionName();
+				},
+				setLabel: (entryId, label) => {
+					this.sessionManager.appendLabelChange(entryId, label);
+				},
+				getActiveTools: () => this.getActiveToolNames(),
+				getAllTools: () => this.getAllTools(),
+				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
+				setModel: async (model) => {
+					const key = await this.modelRegistry.getApiKey(model);
+					if (!key) return false;
+					await this.setModel(model);
+					return true;
+				},
+				getThinkingLevel: () => this.thinkingLevel,
+				setThinkingLevel: (level) => this.setThinkingLevel(level),
+			},
+			{
+				getModel: () => this.model,
+				isIdle: () => !this.isStreaming,
+				abort: () => this.abort(),
+				hasPendingMessages: () => this.pendingMessageCount > 0,
+				shutdown: () => {
+					this._extensionShutdownHandler?.();
+				},
+				getContextUsage: () => this.getContextUsage(),
+				compact: (options) => {
+					void (async () => {
+						try {
+							const result = await this.compact(options?.customInstructions);
+							options?.onComplete?.(result);
+						} catch (error) {
+							const err = error instanceof Error ? error : new Error(String(error));
+							options?.onError?.(err);
+						}
+					})();
+				},
+			},
+		);
+	}
+
+	private _buildRuntime(options: {
+		activeToolNames?: string[];
+		flagValues?: Map<string, boolean | string>;
+		includeAllExtensionTools?: boolean;
+	}): void {
+		const autoResizeImages = this.settingsManager.getImageAutoResize();
+		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
+		const baseTools = this._baseToolsOverride
+			? this._baseToolsOverride
+			: createAllTools(this._cwd, {
+					read: { autoResizeImages },
+					bash: { commandPrefix: shellCommandPrefix },
+				});
+
+		this._baseToolRegistry = new Map(Object.entries(baseTools).map(([name, tool]) => [name, tool as AgentTool]));
+
+		const extensionsResult = this._resourceLoader.getExtensions();
+		if (options.flagValues) {
+			for (const [name, value] of options.flagValues) {
+				extensionsResult.runtime.flagValues.set(name, value);
+			}
+		}
+
+		const hasExtensions = extensionsResult.extensions.length > 0;
+		const hasCustomTools = this._customTools.length > 0;
+		this._extensionRunner =
+			hasExtensions || hasCustomTools
+				? new ExtensionRunner(
+						extensionsResult.extensions,
+						extensionsResult.runtime,
+						this._cwd,
+						this.sessionManager,
+						this._modelRegistry,
+					)
+				: undefined;
+		if (this._extensionRunnerRef) {
+			this._extensionRunnerRef.current = this._extensionRunner;
+		}
+		if (this._extensionRunner) {
+			this._bindExtensionCore(this._extensionRunner);
+			this._applyExtensionBindings(this._extensionRunner);
+		}
+
+		const registeredTools = this._extensionRunner?.getAllRegisteredTools() ?? [];
+		const allCustomTools = [
+			...registeredTools,
+			...this._customTools.map((def) => ({ definition: def, extensionPath: "<sdk>" })),
+		];
+		const wrappedExtensionTools = this._extensionRunner
+			? wrapRegisteredTools(allCustomTools, this._extensionRunner)
+			: [];
+
+		const toolRegistry = new Map(this._baseToolRegistry);
+		for (const tool of wrappedExtensionTools as AgentTool[]) {
+			toolRegistry.set(tool.name, tool);
+		}
+
+		const defaultActiveToolNames = this._baseToolsOverride
+			? Object.keys(this._baseToolsOverride)
+			: ["read", "bash", "edit", "write"];
+		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
+		const activeToolNameSet = new Set<string>(baseActiveToolNames);
+		if (options.includeAllExtensionTools) {
+			for (const tool of wrappedExtensionTools as AgentTool[]) {
+				activeToolNameSet.add(tool.name);
+			}
+		}
+
+		const extensionToolNames = new Set(wrappedExtensionTools.map((tool) => tool.name));
+		const activeBaseTools = Array.from(activeToolNameSet)
+			.filter((name) => this._baseToolRegistry.has(name) && !extensionToolNames.has(name))
+			.map((name) => this._baseToolRegistry.get(name) as AgentTool);
+		const activeExtensionTools = wrappedExtensionTools.filter((tool) => activeToolNameSet.has(tool.name));
+		const activeToolsArray: AgentTool[] = [...activeBaseTools, ...activeExtensionTools];
+
+		if (this._extensionRunner) {
+			const wrappedActiveTools = wrapToolsWithExtensions(activeToolsArray, this._extensionRunner);
+			this.agent.setTools(wrappedActiveTools as AgentTool[]);
+
+			const wrappedAllTools = wrapToolsWithExtensions(Array.from(toolRegistry.values()), this._extensionRunner);
+			this._toolRegistry = new Map(wrappedAllTools.map((tool) => [tool.name, tool]));
+		} else {
+			this.agent.setTools(activeToolsArray);
+			this._toolRegistry = toolRegistry;
+		}
+
+		const systemPromptToolNames = Array.from(activeToolNameSet).filter((name) => this._baseToolRegistry.has(name));
+		this._baseSystemPrompt = this._rebuildSystemPrompt(systemPromptToolNames);
+		this.agent.setSystemPrompt(this._baseSystemPrompt);
+	}
+
+	async reload(): Promise<void> {
+		const previousFlagValues = this._extensionRunner?.getFlagValues();
+		await this._extensionRunner?.emit({ type: "session_shutdown" });
+		await this._resourceLoader.reload();
+		this._buildRuntime({
+			activeToolNames: this.getActiveToolNames(),
+			flagValues: previousFlagValues,
+			includeAllExtensionTools: true,
+		});
+
+		const hasBindings =
+			this._extensionUIContext ||
+			this._extensionCommandContextActions ||
+			this._extensionShutdownHandler ||
+			this._extensionErrorListeners.size > 0;
+		if (this._extensionRunner && hasBindings) {
+			await this._extensionRunner.emit({ type: "session_start" });
+		}
 	}
 
 	// =========================================================================
@@ -1740,13 +2018,17 @@ export class AgentSession {
 	): Promise<BashResult> {
 		this._bashAbortController = new AbortController();
 
+		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
+		const prefix = this.settingsManager.getShellCommandPrefix();
+		const resolvedCommand = prefix ? `${prefix}\n${command}` : command;
+
 		try {
 			const result = options?.operations
-				? await executeBashWithOperations(command, process.cwd(), options.operations, {
+				? await executeBashWithOperations(resolvedCommand, process.cwd(), options.operations, {
 						onChunk,
 						signal: this._bashAbortController.signal,
 					})
-				: await executeBashCommand(command, {
+				: await executeBashCommand(resolvedCommand, {
 						onChunk,
 						signal: this._bashAbortController.signal,
 					});
@@ -1972,11 +2254,13 @@ export class AgentSession {
 	 * @param targetId The entry ID to navigate to
 	 * @param options.summarize Whether user wants to summarize abandoned branch
 	 * @param options.customInstructions Custom instructions for summarizer
+	 * @param options.replaceInstructions If true, customInstructions replaces the default prompt
+	 * @param options.label Label to attach to the branch summary entry
 	 * @returns Result with editorText (if user message) and cancelled status
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string } = {},
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		const oldLeafId = this.sessionManager.getLeafId();
 
@@ -2002,13 +2286,20 @@ export class AgentSession {
 			targetId,
 		);
 
-		// Prepare event data
+		// Prepare event data - mutable so extensions can override
+		let customInstructions = options.customInstructions;
+		let replaceInstructions = options.replaceInstructions;
+		let label = options.label;
+
 		const preparation: TreePreparation = {
 			targetId,
 			oldLeafId,
 			commonAncestorId,
 			entriesToSummarize,
 			userWantsSummary: options.summarize ?? false,
+			customInstructions,
+			replaceInstructions,
+			label,
 		};
 
 		// Set up abort controller for summarization
@@ -2032,6 +2323,17 @@ export class AgentSession {
 				extensionSummary = result.summary;
 				fromExtension = true;
 			}
+
+			// Allow extensions to override instructions and label
+			if (result?.customInstructions !== undefined) {
+				customInstructions = result.customInstructions;
+			}
+			if (result?.replaceInstructions !== undefined) {
+				replaceInstructions = result.replaceInstructions;
+			}
+			if (result?.label !== undefined) {
+				label = result.label;
+			}
 		}
 
 		// Run default summarizer if needed
@@ -2048,7 +2350,8 @@ export class AgentSession {
 				model,
 				apiKey,
 				signal: this._branchSummaryAbortController.signal,
-				customInstructions: options.customInstructions,
+				customInstructions,
+				replaceInstructions,
 				reserveTokens: branchSummarySettings.reserveTokens,
 			});
 			this._branchSummaryAbortController = undefined;
@@ -2098,12 +2401,22 @@ export class AgentSession {
 			// Create summary at target position (can be null for root)
 			const summaryId = this.sessionManager.branchWithSummary(newLeafId, summaryText, summaryDetails, fromExtension);
 			summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+
+			// Attach label to the summary entry
+			if (label) {
+				this.sessionManager.appendLabelChange(summaryId, label);
+			}
 		} else if (newLeafId === null) {
 			// No summary, navigating to root - reset leaf
 			this.sessionManager.resetLeaf();
 		} else {
 			// No summary, navigating to non-root
 			this.sessionManager.branch(newLeafId);
+		}
+
+		// Attach label to target entry when not summarizing (no summary entry to label)
+		if (label && !summaryText) {
+			this.sessionManager.appendLabelChange(targetId, label);
 		}
 
 		// Update agent state
@@ -2202,6 +2515,26 @@ export class AgentSession {
 				total: totalInput + totalOutput + totalCacheRead + totalCacheWrite,
 			},
 			cost: totalCost,
+		};
+	}
+
+	getContextUsage(): ContextUsage | undefined {
+		const model = this.model;
+		if (!model) return undefined;
+
+		const contextWindow = model.contextWindow ?? 0;
+		if (contextWindow <= 0) return undefined;
+
+		const estimate = estimateContextTokens(this.messages);
+		const percent = (estimate.tokens / contextWindow) * 100;
+
+		return {
+			tokens: estimate.tokens,
+			contextWindow,
+			percent,
+			usageTokens: estimate.usageTokens,
+			trailingTokens: estimate.trailingTokens,
+			lastUsageIndex: estimate.lastUsageIndex,
 		};
 	}
 

@@ -85,8 +85,9 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		try {
 			// Create OpenAI client
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const client = createClient(model, context, apiKey);
+			const client = createClient(model, context, apiKey, options?.headers);
 			const params = buildParams(model, context, options);
+			options?.onPayload?.(params);
 			const openaiStream = await client.responses.create(
 				params,
 				options?.signal ? { signal: options.signal } : undefined,
@@ -318,7 +319,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 	return stream;
 };
 
-function createClient(model: Model<"openai-responses">, context: Context, apiKey?: string) {
+function createClient(
+	model: Model<"openai-responses">,
+	context: Context,
+	apiKey?: string,
+	optionsHeaders?: Record<string, string>,
+) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
 			throw new Error(
@@ -352,6 +358,11 @@ function createClient(model: Model<"openai-responses">, context: Context, apiKey
 		if (hasImages) {
 			headers["Copilot-Vision-Request"] = "true";
 		}
+	}
+
+	// Merge options headers last so they can override defaults
+	if (optionsHeaders) {
+		Object.assign(headers, optionsHeaders);
 	}
 
 	return new OpenAI({
@@ -417,7 +428,23 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 function convertMessages(model: Model<"openai-responses">, context: Context): ResponseInput {
 	const messages: ResponseInput = [];
 
-	const transformedMessages = transformMessages(context.messages, model);
+	const normalizeToolCallId = (id: string): string => {
+		const allowedProviders = new Set(["openai", "openai-codex", "opencode"]);
+		if (!allowedProviders.has(model.provider)) return id;
+		if (!id.includes("|")) return id;
+		const [callId, itemId] = id.split("|");
+		const sanitizedCallId = callId.replace(/[^a-zA-Z0-9_-]/g, "_");
+		let sanitizedItemId = itemId.replace(/[^a-zA-Z0-9_-]/g, "_");
+		// OpenAI Responses API requires item id to start with "fc"
+		if (!sanitizedItemId.startsWith("fc")) {
+			sanitizedItemId = `fc_${sanitizedItemId}`;
+		}
+		const normalizedCallId = sanitizedCallId.length > 64 ? sanitizedCallId.slice(0, 64) : sanitizedCallId;
+		const normalizedItemId = sanitizedItemId.length > 64 ? sanitizedItemId.slice(0, 64) : sanitizedItemId;
+		return `${normalizedCallId}|${normalizedItemId}`;
+	};
+
+	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
 
 	if (context.systemPrompt) {
 		const role = model.reasoning ? "developer" : "system";
@@ -461,10 +488,18 @@ function convertMessages(model: Model<"openai-responses">, context: Context): Re
 			}
 		} else if (msg.role === "assistant") {
 			const output: ResponseInput = [];
+			const assistantMsg = msg as AssistantMessage;
+
+			// Check if this message is from a different model (same provider, different model ID).
+			// For such messages, tool call IDs with fc_ prefix need to be stripped to avoid
+			// OpenAI's reasoning/function_call pairing validation errors.
+			const isDifferentModel =
+				assistantMsg.model !== model.id &&
+				assistantMsg.provider === model.provider &&
+				assistantMsg.api === model.api;
 
 			for (const block of msg.content) {
-				// Do not submit thinking blocks if the completion had an error (i.e. abort)
-				if (block.type === "thinking" && msg.stopReason !== "error") {
+				if (block.type === "thinking") {
 					if (block.thinkingSignature) {
 						const reasoningItem = JSON.parse(block.thinkingSignature);
 						output.push(reasoningItem);
@@ -485,13 +520,22 @@ function convertMessages(model: Model<"openai-responses">, context: Context): Re
 						status: "completed",
 						id: msgId,
 					} satisfies ResponseOutputMessage);
-					// Do not submit toolcall blocks if the completion had an error (i.e. abort)
-				} else if (block.type === "toolCall" && msg.stopReason !== "error") {
+				} else if (block.type === "toolCall") {
 					const toolCall = block as ToolCall;
+					const callId = toolCall.id.split("|")[0];
+					let itemId: string | undefined = toolCall.id.split("|")[1];
+
+					// For different-model messages, set id to undefined to avoid pairing validation.
+					// OpenAI tracks which fc_xxx IDs were paired with rs_xxx reasoning items.
+					// By omitting the id, we avoid triggering that validation (like cross-provider does).
+					if (isDifferentModel && itemId?.startsWith("fc_")) {
+						itemId = undefined;
+					}
+
 					output.push({
 						type: "function_call",
-						id: toolCall.id.split("|")[1],
-						call_id: toolCall.id.split("|")[0],
+						id: itemId,
+						call_id: callId,
 						name: toolCall.name,
 						arguments: JSON.stringify(toolCall.arguments),
 					});

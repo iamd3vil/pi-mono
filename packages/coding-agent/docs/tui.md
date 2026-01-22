@@ -52,6 +52,36 @@ When a `Focusable` component has focus, TUI:
 
 This enables IME candidate windows to appear at the correct position for CJK input methods. The `Editor` and `Input` built-in components already implement this interface.
 
+### Container Components with Embedded Inputs
+
+When a container component (dialog, selector, etc.) contains an `Input` or `Editor` child, the container must implement `Focusable` and propagate the focus state to the child. Otherwise, the hardware cursor won't be positioned correctly for IME input.
+
+```typescript
+import { Container, type Focusable, Input } from "@mariozechner/pi-tui";
+
+class SearchDialog extends Container implements Focusable {
+  private searchInput: Input;
+
+  // Focusable implementation - propagate to child input for IME cursor positioning
+  private _focused = false;
+  get focused(): boolean {
+    return this._focused;
+  }
+  set focused(value: boolean) {
+    this._focused = value;
+    this.searchInput.focused = value;
+  }
+
+  constructor() {
+    super();
+    this.searchInput = new Input();
+    this.addChild(this.searchInput);
+  }
+}
+```
+
+Without this propagation, typing with an IME (Chinese, Japanese, Korean, etc.) will show the candidate window in the wrong position on screen.
+
 ## Using Components
 
 **In hooks** via `ctx.ui.custom()`:
@@ -674,13 +704,16 @@ ctx.ui.setStatus("my-ext", undefined);
 
 **Examples:** [status-line.ts](../examples/extensions/status-line.ts), [plan-mode.ts](../examples/extensions/plan-mode.ts), [preset.ts](../examples/extensions/preset.ts)
 
-### Pattern 5: Widget Above Editor
+### Pattern 5: Widgets Above/Below Editor
 
-Show persistent content above the input editor. Good for todo lists, progress.
+Show persistent content above or below the input editor. Good for todo lists, progress.
 
 ```typescript
-// Simple string array
+// Simple string array (above editor by default)
 ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);
+
+// Render below the editor
+ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"], { placement: "belowEditor" });
 
 // Or with theme
 ctx.ui.setWidget("my-widget", (_tui, theme) => {

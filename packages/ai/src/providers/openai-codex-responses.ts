@@ -1,10 +1,16 @@
-import os from "node:os";
+// NEVER convert to top-level import - breaks browser/Vite builds (web-ui)
+let _os: typeof import("node:os") | null = null;
+if (typeof process !== "undefined" && process.versions?.node) {
+	import("node:os").then((m) => {
+		_os = m;
+	});
+}
+
 import type {
 	ResponseFunctionToolCall,
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 } from "openai/resources/responses/responses.js";
-import { PI_STATIC_INSTRUCTIONS } from "../constants.js";
 import { calculateCost } from "../models.js";
 import { getEnvApiKey } from "../stream.js";
 import type {
@@ -123,7 +129,8 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 
 			const accountId = extractAccountId(apiKey);
 			const body = buildRequestBody(model, context, options);
-			const headers = buildHeaders(model.headers, accountId, apiKey, options?.sessionId);
+			options?.onPayload?.(body);
+			const headers = buildHeaders(model.headers, options?.headers, accountId, apiKey, options?.sessionId);
 			const bodyJson = JSON.stringify(body);
 
 			// Fetch with retry logic for rate limits and transient errors
@@ -215,22 +222,14 @@ function buildRequestBody(
 	context: Context,
 	options?: OpenAICodexResponsesOptions,
 ): RequestBody {
-	const systemPrompt = buildSystemPrompt(context.systemPrompt);
 	const messages = convertMessages(model, context);
-
-	// Prepend developer messages
-	const developerMessages = systemPrompt.developerMessages.map((text) => ({
-		type: "message",
-		role: "developer",
-		content: [{ type: "input_text", text }],
-	}));
 
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
 		stream: true,
-		instructions: systemPrompt.instructions,
-		input: [...developerMessages, ...messages],
+		instructions: context.systemPrompt,
+		input: messages,
 		text: { verbosity: options?.textVerbosity || "medium" },
 		include: ["reasoning.encrypted_content"],
 		prompt_cache_key: options?.sessionId,
@@ -262,23 +261,6 @@ function buildRequestBody(
 	return body;
 }
 
-function buildSystemPrompt(userSystemPrompt?: string): { instructions: string; developerMessages: string[] } {
-	// PI_STATIC_INSTRUCTIONS is whitelisted and must be in the instructions field.
-	// User's system prompt goes in developer messages, with the static prefix stripped.
-	const staticPrefix = PI_STATIC_INSTRUCTIONS.trim();
-	const developerMessages: string[] = [];
-
-	if (userSystemPrompt?.trim()) {
-		let dynamicPart = userSystemPrompt.trim();
-		if (dynamicPart.startsWith(staticPrefix)) {
-			dynamicPart = dynamicPart.slice(staticPrefix.length).trim();
-		}
-		if (dynamicPart) developerMessages.push(dynamicPart);
-	}
-
-	return { instructions: staticPrefix, developerMessages };
-}
-
 function clampReasoningEffort(modelId: string, effort: string): string {
 	const id = modelId.includes("/") ? modelId.split("/").pop()! : modelId;
 	if (id.startsWith("gpt-5.2") && effort === "minimal") return "low";
@@ -293,7 +275,23 @@ function clampReasoningEffort(modelId: string, effort: string): string {
 
 function convertMessages(model: Model<"openai-codex-responses">, context: Context): unknown[] {
 	const messages: unknown[] = [];
-	const transformed = transformMessages(context.messages, model);
+	const normalizeToolCallId = (id: string): string => {
+		const allowedProviders = new Set(["openai", "openai-codex", "opencode"]);
+		if (!allowedProviders.has(model.provider)) return id;
+		if (!id.includes("|")) return id;
+		const [callId, itemId] = id.split("|");
+		const sanitizedCallId = callId.replace(/[^a-zA-Z0-9_-]/g, "_");
+		let sanitizedItemId = itemId.replace(/[^a-zA-Z0-9_-]/g, "_");
+		// OpenAI Codex Responses API requires item id to start with "fc"
+		if (!sanitizedItemId.startsWith("fc")) {
+			sanitizedItemId = `fc_${sanitizedItemId}`;
+		}
+		const normalizedCallId = sanitizedCallId.length > 64 ? sanitizedCallId.slice(0, 64) : sanitizedCallId;
+		const normalizedItemId = sanitizedItemId.length > 64 ? sanitizedItemId.slice(0, 64) : sanitizedItemId;
+		return `${normalizedCallId}|${normalizedItemId}`;
+	};
+
+	const transformed = transformMessages(context.messages, model, normalizeToolCallId);
 
 	for (const msg of transformed) {
 		if (msg.role === "user") {
@@ -338,7 +336,7 @@ function convertAssistantMessage(msg: AssistantMessage): unknown[] {
 	const output: unknown[] = [];
 
 	for (const block of msg.content) {
-		if (block.type === "thinking" && msg.stopReason !== "error" && block.thinkingSignature) {
+		if (block.type === "thinking" && block.thinkingSignature) {
 			output.push(JSON.parse(block.thinkingSignature));
 		} else if (block.type === "text") {
 			output.push({
@@ -347,7 +345,7 @@ function convertAssistantMessage(msg: AssistantMessage): unknown[] {
 				content: [{ type: "output_text", text: sanitizeSurrogates(block.text), annotations: [] }],
 				status: "completed",
 			});
-		} else if (block.type === "toolCall" && msg.stopReason !== "error") {
+		} else if (block.type === "toolCall") {
 			const [callId, id] = block.id.split("|");
 			output.push({
 				type: "function_call",
@@ -695,7 +693,7 @@ function extractAccountId(token: string): string {
 	try {
 		const parts = token.split(".");
 		if (parts.length !== 3) throw new Error("Invalid token");
-		const payload = JSON.parse(Buffer.from(parts[1], "base64").toString("utf-8"));
+		const payload = JSON.parse(atob(parts[1]));
 		const accountId = payload?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
 		if (!accountId) throw new Error("No account ID in token");
 		return accountId;
@@ -706,6 +704,7 @@ function extractAccountId(token: string): string {
 
 function buildHeaders(
 	initHeaders: Record<string, string> | undefined,
+	additionalHeaders: Record<string, string> | undefined,
 	accountId: string,
 	token: string,
 	sessionId?: string,
@@ -715,9 +714,13 @@ function buildHeaders(
 	headers.set("chatgpt-account-id", accountId);
 	headers.set("OpenAI-Beta", "responses=experimental");
 	headers.set("originator", "pi");
-	headers.set("User-Agent", `pi (${os.platform()} ${os.release()}; ${os.arch()})`);
+	const userAgent = _os ? `pi (${_os.platform()} ${_os.release()}; ${_os.arch()})` : "pi (browser)";
+	headers.set("User-Agent", userAgent);
 	headers.set("accept", "text/event-stream");
 	headers.set("content-type", "application/json");
+	for (const [key, value] of Object.entries(additionalHeaders || {})) {
+		headers.set(key, value);
+	}
 
 	if (sessionId) {
 		headers.set("session_id", sessionId);

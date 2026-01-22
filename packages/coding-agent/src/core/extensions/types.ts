@@ -68,6 +68,15 @@ export interface ExtensionUIDialogOptions {
 	timeout?: number;
 }
 
+/** Placement for extension widgets. */
+export type WidgetPlacement = "aboveEditor" | "belowEditor";
+
+/** Options for extension widgets. */
+export interface ExtensionWidgetOptions {
+	/** Where the widget is rendered. Defaults to "aboveEditor". */
+	placement?: WidgetPlacement;
+}
+
 /**
  * UI context for extensions to request interactive UI.
  * Each mode (interactive, RPC, print) provides its own implementation.
@@ -91,9 +100,13 @@ export interface ExtensionUIContext {
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
 
-	/** Set a widget to display above the editor. Accepts string array or component factory. */
-	setWidget(key: string, content: string[] | undefined): void;
-	setWidget(key: string, content: ((tui: TUI, theme: Theme) => Component & { dispose?(): void }) | undefined): void;
+	/** Set a widget to display above or below the editor. Accepts string array or component factory. */
+	setWidget(key: string, content: string[] | undefined, options?: ExtensionWidgetOptions): void;
+	setWidget(
+		key: string,
+		content: ((tui: TUI, theme: Theme) => Component & { dispose?(): void }) | undefined,
+		options?: ExtensionWidgetOptions,
+	): void;
 
 	/** Set a custom footer component, or undefined to restore the built-in footer.
 	 *
@@ -193,6 +206,21 @@ export interface ExtensionUIContext {
 // Extension Context
 // ============================================================================
 
+export interface ContextUsage {
+	tokens: number;
+	contextWindow: number;
+	percent: number;
+	usageTokens: number;
+	trailingTokens: number;
+	lastUsageIndex: number | null;
+}
+
+export interface CompactOptions {
+	customInstructions?: string;
+	onComplete?: (result: CompactionResult) => void;
+	onError?: (error: Error) => void;
+}
+
 /**
  * Context passed to extension event handlers.
  */
@@ -217,6 +245,10 @@ export interface ExtensionContext {
 	hasPendingMessages(): boolean;
 	/** Gracefully shutdown pi and exit. Available in all contexts. */
 	shutdown(): void;
+	/** Get current context usage for the active model. */
+	getContextUsage(): ContextUsage | undefined;
+	/** Trigger compaction without awaiting completion. */
+	compact(options?: CompactOptions): void;
 }
 
 /**
@@ -237,7 +269,10 @@ export interface ExtensionCommandContext extends ExtensionContext {
 	fork(entryId: string): Promise<{ cancelled: boolean }>;
 
 	/** Navigate to a different point in the session tree. */
-	navigateTree(targetId: string, options?: { summarize?: boolean }): Promise<{ cancelled: boolean }>;
+	navigateTree(
+		targetId: string,
+		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
+	): Promise<{ cancelled: boolean }>;
 }
 
 // ============================================================================
@@ -344,6 +379,12 @@ export interface TreePreparation {
 	commonAncestorId: string | null;
 	entriesToSummarize: SessionEntry[];
 	userWantsSummary: boolean;
+	/** Custom instructions for summarization */
+	customInstructions?: string;
+	/** If true, customInstructions replaces the default prompt instead of being appended */
+	replaceInstructions?: boolean;
+	/** Label to attach to the branch summary entry */
+	label?: string;
 }
 
 /** Fired before navigating in the session tree (can be cancelled) */
@@ -633,6 +674,12 @@ export interface SessionBeforeTreeResult {
 		summary: string;
 		details?: unknown;
 	};
+	/** Override custom instructions for summarization */
+	customInstructions?: string;
+	/** Override whether customInstructions replaces the default prompt */
+	replaceInstructions?: boolean;
+	/** Override label to attach to the branch summary entry */
+	label?: string;
 }
 
 // ============================================================================
@@ -779,6 +826,9 @@ export interface ExtensionAPI {
 	/** Get the current session name, if set. */
 	getSessionName(): string | undefined;
 
+	/** Set or clear a label on an entry. Labels are user-defined markers for bookmarking/navigation. */
+	setLabel(entryId: string, label: string | undefined): void;
+
 	/** Execute a shell command. */
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
 
@@ -868,6 +918,8 @@ export type GetThinkingLevelHandler = () => ThinkingLevel;
 
 export type SetThinkingLevelHandler = (level: ThinkingLevel) => void;
 
+export type SetLabelHandler = (entryId: string, label: string | undefined) => void;
+
 /**
  * Shared state created by loader, used during registration and runtime.
  * Contains flag values (defaults set during registration, CLI values set after).
@@ -886,6 +938,7 @@ export interface ExtensionActions {
 	appendEntry: AppendEntryHandler;
 	setSessionName: SetSessionNameHandler;
 	getSessionName: GetSessionNameHandler;
+	setLabel: SetLabelHandler;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
 	setActiveTools: SetActiveToolsHandler;
@@ -904,6 +957,8 @@ export interface ExtensionContextActions {
 	abort: () => void;
 	hasPendingMessages: () => boolean;
 	shutdown: () => void;
+	getContextUsage: () => ContextUsage | undefined;
+	compact: (options?: CompactOptions) => void;
 }
 
 /**
@@ -917,7 +972,10 @@ export interface ExtensionCommandContextActions {
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 	}) => Promise<{ cancelled: boolean }>;
 	fork: (entryId: string) => Promise<{ cancelled: boolean }>;
-	navigateTree: (targetId: string, options?: { summarize?: boolean }) => Promise<{ cancelled: boolean }>;
+	navigateTree: (
+		targetId: string,
+		options?: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
+	) => Promise<{ cancelled: boolean }>;
 }
 
 /**

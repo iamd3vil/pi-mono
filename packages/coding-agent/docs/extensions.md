@@ -115,8 +115,20 @@ Additional paths via `settings.json`:
 
 ```json
 {
-  "extensions": ["/path/to/extension.ts", "/path/to/extension/dir"]
+  "extensions": [
+    "npm:@foo/bar@1.0.0",
+    "git:github.com/user/repo@v1",
+    "/path/to/extension.ts",
+    "/path/to/extension/dir"
+  ]
 }
+```
+
+Use `pi install` and `pi remove` to manage extension sources in settings:
+
+```bash
+pi install npm:@foo/bar@1.0.0
+pi remove npm:@foo/bar
 ```
 
 **Discovery rules:**
@@ -146,13 +158,17 @@ Additional paths via `settings.json`:
     "zod": "^3.0.0"
   },
   "pi": {
-    "extensions": ["./src/safety-gates.ts", "./src/custom-tools.ts"]
+    "extensions": ["./src/safety-gates.ts", "./src/custom-tools.ts"],
+    "skills": ["./skills/"],
+    "prompts": ["./prompts/"],
+    "themes": ["./themes/dark.json"]
   }
 }
 ```
 
 The `package.json` approach enables:
 - Multiple extensions from one package
+- Skills, prompts, and themes declared alongside extensions
 - Third-party npm dependencies (resolved via jiti)
 - Nested source structure (no depth limit within the package)
 - Deployment to and installation from npm
@@ -184,7 +200,7 @@ export default function (pi: ExtensionAPI) {
     const ok = await ctx.ui.confirm("Title", "Are you sure?");
     ctx.ui.notify("Done!", "success");
     ctx.ui.setStatus("my-ext", "Processing...");  // Footer status
-    ctx.ui.setWidget("my-ext", ["Line 1", "Line 2"]);  // Widget above editor
+    ctx.ui.setWidget("my-ext", ["Line 1", "Line 2"]);  // Widget above editor (default)
   });
 
   // Register tools, commands, shortcuts, flags
@@ -384,7 +400,7 @@ pi.on("session_compact", async (event, ctx) => {
 });
 ```
 
-**Examples:** [custom-compaction.ts](../examples/extensions/custom-compaction.ts)
+**Examples:** [custom-compaction.ts](../examples/extensions/custom-compaction.ts), [trigger-compact.ts](../examples/extensions/trigger-compact.ts)
 
 #### session_before_tree / session_tree
 
@@ -677,6 +693,33 @@ pi.on("tool_call", (event, ctx) => {
 });
 ```
 
+### ctx.getContextUsage()
+
+Returns current context usage for the active model. Uses last assistant usage when available, then estimates tokens for trailing messages.
+
+```typescript
+const usage = ctx.getContextUsage();
+if (usage && usage.tokens > 100_000) {
+  // ...
+}
+```
+
+### ctx.compact()
+
+Trigger compaction without awaiting completion. Use `onComplete` and `onError` for follow-up actions.
+
+```typescript
+ctx.compact({
+  customInstructions: "Focus on recent changes",
+  onComplete: (result) => {
+    ctx.ui.notify("Compaction completed", "info");
+  },
+  onError: (error) => {
+    ctx.ui.notify(`Compaction failed: ${error.message}`, "error");
+  },
+});
+```
+
 ## ExtensionCommandContext
 
 Command handlers receive `ExtensionCommandContext`, which extends `ExtensionContext` with session control methods. These are only available in commands because they can deadlock if called from event handlers.
@@ -733,8 +776,17 @@ Navigate to a different point in the session tree:
 ```typescript
 const result = await ctx.navigateTree("entry-id-456", {
   summarize: true,
+  customInstructions: "Focus on error handling changes",
+  replaceInstructions: false, // true = replace default prompt entirely
+  label: "review-checkpoint",
 });
 ```
+
+Options:
+- `summarize`: Whether to generate a summary of the abandoned branch
+- `customInstructions`: Custom instructions for the summarizer
+- `replaceInstructions`: If true, `customInstructions` replaces the default prompt instead of being appended
+- `label`: Label to attach to the branch summary entry (or target entry if not summarizing)
 
 ## ExtensionAPI Methods
 
@@ -867,6 +919,23 @@ if (name) {
   console.log(`Session: ${name}`);
 }
 ```
+
+### pi.setLabel(entryId, label)
+
+Set or clear a label on an entry. Labels are user-defined markers for bookmarking and navigation (shown in `/tree` selector).
+
+```typescript
+// Set a label
+pi.setLabel(entryId, "checkpoint-before-refactor");
+
+// Clear a label
+pi.setLabel(entryId, undefined);
+
+// Read labels via sessionManager
+const label = ctx.sessionManager.getLabel(entryId);
+```
+
+Labels persist in the session and survive restarts. Use them to mark important points (turns, checkpoints) in the conversation tree.
 
 ### pi.registerCommand(name, options)
 
@@ -1267,6 +1336,28 @@ renderResult(result, { expanded, isPartial }, theme) {
 }
 ```
 
+#### Keybinding Hints
+
+Use `keyHint()` to display keybinding hints that respect user's keybinding configuration:
+
+```typescript
+import { keyHint } from "@mariozechner/pi-coding-agent";
+
+renderResult(result, { expanded }, theme) {
+  let text = theme.fg("success", "✓ Done");
+  if (!expanded) {
+    text += ` (${keyHint("expandTools", "to expand")})`;
+  }
+  return new Text(text, 0, 0);
+}
+```
+
+Available functions:
+- `keyHint(action, description)` - Editor actions (e.g., `"expandTools"`, `"selectConfirm"`)
+- `appKeyHint(keybindings, action, description)` - App actions (requires `KeybindingsManager`)
+- `editorKey(action)` - Get raw key string for editor action
+- `rawKeyHint(key, description)` - Format a raw key string
+
 #### Best Practices
 
 - Use `Text` with padding `(0, 0)` - the Box handles padding
@@ -1291,7 +1382,7 @@ Extensions can interact with users via `ctx.ui` methods and customize how messag
 - Settings toggles (SettingsList)
 - Status indicators (setStatus)
 - Working message during streaming (setWorkingMessage)
-- Widgets above editor (setWidget)
+- Widgets above/below editor (setWidget)
 - Custom footers (setFooter)
 
 ### Dialogs
@@ -1381,8 +1472,10 @@ ctx.ui.setStatus("my-ext", undefined);  // Clear
 ctx.ui.setWorkingMessage("Thinking deeply...");
 ctx.ui.setWorkingMessage();  // Restore default
 
-// Widget above editor (string array or factory function)
+// Widget above editor (default)
 ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"]);
+// Widget below editor
+ctx.ui.setWidget("my-widget", ["Line 1", "Line 2"], { placement: "belowEditor" });
 ctx.ui.setWidget("my-widget", (tui, theme) => new Text(theme.fg("accent", "Custom"), 0, 0));
 ctx.ui.setWidget("my-widget", undefined);  // Clear
 

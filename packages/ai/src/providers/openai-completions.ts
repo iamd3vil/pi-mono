@@ -15,7 +15,7 @@ import type {
 	Context,
 	Message,
 	Model,
-	OpenAICompat,
+	OpenAICompletionsCompat,
 	StopReason,
 	StreamFunction,
 	StreamOptions,
@@ -23,6 +23,7 @@ import type {
 	ThinkingContent,
 	Tool,
 	ToolCall,
+	ToolResultMessage,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
@@ -33,8 +34,7 @@ import { transformMessages } from "./transform-messages.js";
  * Normalize tool call ID for Mistral.
  * Mistral requires tool IDs to be exactly 9 alphanumeric characters (a-z, A-Z, 0-9).
  */
-function normalizeMistralToolId(id: string, isMistral: boolean): string {
-	if (!isMistral) return id;
+function normalizeMistralToolId(id: string): string {
 	// Remove non-alphanumeric characters
 	let normalized = id.replace(/[^a-zA-Z0-9]/g, "");
 	// Mistral requires exactly 9 characters
@@ -100,8 +100,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const client = createClient(model, context, apiKey);
+			const client = createClient(model, context, apiKey, options?.headers);
 			const params = buildParams(model, context, options);
+			options?.onPayload?.(params);
 			const openaiStream = await client.chat.completions.create(params, { signal: options?.signal });
 			stream.push({ type: "start", partial: output });
 
@@ -318,7 +319,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	return stream;
 };
 
-function createClient(model: Model<"openai-completions">, context: Context, apiKey?: string) {
+function createClient(
+	model: Model<"openai-completions">,
+	context: Context,
+	apiKey?: string,
+	optionsHeaders?: Record<string, string>,
+) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
 			throw new Error(
@@ -352,6 +358,11 @@ function createClient(model: Model<"openai-completions">, context: Context, apiK
 		if (hasImages) {
 			headers["Copilot-Vision-Request"] = "true";
 		}
+	}
+
+	// Merge options headers last so they can override defaults
+	if (optionsHeaders) {
+		Object.assign(headers, optionsHeaders);
 	}
 
 	return new OpenAI({
@@ -449,14 +460,24 @@ function maybeAddOpenRouterAnthropicCacheControl(
 	}
 }
 
-function convertMessages(
+export function convertMessages(
 	model: Model<"openai-completions">,
 	context: Context,
-	compat: Required<OpenAICompat>,
+	compat: Required<OpenAICompletionsCompat>,
 ): ChatCompletionMessageParam[] {
 	const params: ChatCompletionMessageParam[] = [];
 
-	const transformedMessages = transformMessages(context.messages, model);
+	const normalizeToolCallId = (id: string): string => {
+		if (compat.requiresMistralToolIds) return normalizeMistralToolId(id);
+		if (model.provider === "openai") return id.length > 40 ? id.slice(0, 40) : id;
+		// Copilot Claude models route to Claude backend which requires Anthropic ID format
+		if (model.provider === "github-copilot" && model.id.toLowerCase().includes("claude")) {
+			return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+		}
+		return id;
+	};
+
+	const transformedMessages = transformMessages(context.messages, model, (id) => normalizeToolCallId(id));
 
 	if (context.systemPrompt) {
 		const useDeveloperRole = model.reasoning && compat.supportsDeveloperRole;
@@ -466,7 +487,8 @@ function convertMessages(
 
 	let lastRole: string | null = null;
 
-	for (const msg of transformedMessages) {
+	for (let i = 0; i < transformedMessages.length; i++) {
+		const msg = transformedMessages[i];
 		// Some providers (e.g. Mistral/Devstral) don't allow user messages directly after tool results
 		// Insert a synthetic assistant message to bridge the gap
 		if (compat.requiresAssistantAfterToolResult && lastRole === "toolResult" && msg.role === "user") {
@@ -555,7 +577,7 @@ function convertMessages(
 			const toolCalls = msg.content.filter((b) => b.type === "toolCall") as ToolCall[];
 			if (toolCalls.length > 0) {
 				assistantMsg.tool_calls = toolCalls.map((tc) => ({
-					id: normalizeMistralToolId(tc.id, compat.requiresMistralToolIds),
+					id: tc.id,
 					type: "function" as const,
 					function: {
 						name: tc.name,
@@ -590,55 +612,71 @@ function convertMessages(
 			}
 			params.push(assistantMsg);
 		} else if (msg.role === "toolResult") {
-			// Extract text and image content
-			const textResult = msg.content
-				.filter((c) => c.type === "text")
-				.map((c) => (c as any).text)
-				.join("\n");
-			const hasImages = msg.content.some((c) => c.type === "image");
+			const imageBlocks: Array<{ type: "image_url"; image_url: { url: string } }> = [];
+			let j = i;
 
-			// Always send tool result with text (or placeholder if only images)
-			const hasText = textResult.length > 0;
-			// Some providers (e.g. Mistral) require the 'name' field in tool results
-			const toolResultMsg: ChatCompletionToolMessageParam = {
-				role: "tool",
-				content: sanitizeSurrogates(hasText ? textResult : "(see attached image)"),
-				tool_call_id: normalizeMistralToolId(msg.toolCallId, compat.requiresMistralToolIds),
-			};
-			if (compat.requiresToolResultName && msg.toolName) {
-				(toolResultMsg as any).name = msg.toolName;
-			}
-			params.push(toolResultMsg);
+			for (; j < transformedMessages.length && transformedMessages[j].role === "toolResult"; j++) {
+				const toolMsg = transformedMessages[j] as ToolResultMessage;
 
-			// If there are images and model supports them, send a follow-up user message with images
-			if (hasImages && model.input.includes("image")) {
-				const contentBlocks: Array<
-					{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }
-				> = [];
+				// Extract text and image content
+				const textResult = toolMsg.content
+					.filter((c) => c.type === "text")
+					.map((c) => (c as any).text)
+					.join("\n");
+				const hasImages = toolMsg.content.some((c) => c.type === "image");
 
-				// Add text prefix
-				contentBlocks.push({
-					type: "text",
-					text: "Attached image(s) from tool result:",
-				});
+				// Always send tool result with text (or placeholder if only images)
+				const hasText = textResult.length > 0;
+				// Some providers (e.g. Mistral) require the 'name' field in tool results
+				const toolResultMsg: ChatCompletionToolMessageParam = {
+					role: "tool",
+					content: sanitizeSurrogates(hasText ? textResult : "(see attached image)"),
+					tool_call_id: toolMsg.toolCallId,
+				};
+				if (compat.requiresToolResultName && toolMsg.toolName) {
+					(toolResultMsg as any).name = toolMsg.toolName;
+				}
+				params.push(toolResultMsg);
 
-				// Add images
-				for (const block of msg.content) {
-					if (block.type === "image") {
-						contentBlocks.push({
-							type: "image_url",
-							image_url: {
-								url: `data:${(block as any).mimeType};base64,${(block as any).data}`,
-							},
-						});
+				if (hasImages && model.input.includes("image")) {
+					for (const block of toolMsg.content) {
+						if (block.type === "image") {
+							imageBlocks.push({
+								type: "image_url",
+								image_url: {
+									url: `data:${(block as any).mimeType};base64,${(block as any).data}`,
+								},
+							});
+						}
 					}
+				}
+			}
+
+			i = j - 1;
+
+			if (imageBlocks.length > 0) {
+				if (compat.requiresAssistantAfterToolResult) {
+					params.push({
+						role: "assistant",
+						content: "I have processed the tool results.",
+					});
 				}
 
 				params.push({
 					role: "user",
-					content: contentBlocks,
+					content: [
+						{
+							type: "text",
+							text: "Attached image(s) from tool result:",
+						},
+						...imageBlocks,
+					],
 				});
+				lastRole = "user";
+			} else {
+				lastRole = "toolResult";
 			}
+			continue;
 		}
 
 		lastRole = msg.role;
@@ -681,9 +719,9 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"]): Sto
 /**
  * Detect compatibility settings from provider and baseUrl for known providers.
  * Provider takes precedence over URL-based detection since it's explicitly configured.
- * Returns a fully resolved OpenAICompat object with all fields set.
+ * Returns a fully resolved OpenAICompletionsCompat object with all fields set.
  */
-function detectCompat(model: Model<"openai-completions">): Required<OpenAICompat> {
+function detectCompat(model: Model<"openai-completions">): Required<OpenAICompletionsCompat> {
 	const provider = model.provider;
 	const baseUrl = model.baseUrl;
 
@@ -725,7 +763,7 @@ function detectCompat(model: Model<"openai-completions">): Required<OpenAICompat
  * Get resolved compatibility settings for a model.
  * Uses explicit model.compat if provided, otherwise auto-detects from provider/URL.
  */
-function getCompat(model: Model<"openai-completions">): Required<OpenAICompat> {
+function getCompat(model: Model<"openai-completions">): Required<OpenAICompletionsCompat> {
 	const detected = detectCompat(model);
 	if (!model.compat) return detected;
 
