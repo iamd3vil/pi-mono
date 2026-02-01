@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.50.9] - 2026-02-01
+
+## [0.50.8] - 2026-02-01
+
+### Added
+
+- Added `maxRetryDelayMs` option to `AgentOptions` to cap server-requested retry delays. Passed through to the underlying stream function. ([#1123](https://github.com/badlogic/pi-mono/issues/1123))
+
+## [0.50.7] - 2026-01-31
+
+## [0.50.6] - 2026-01-30
+
+## [0.50.5] - 2026-01-30
+
+## [0.50.3] - 2026-01-29
+
+## [0.50.2] - 2026-01-29
+
+## [0.50.1] - 2026-01-26
+
+## [0.50.0] - 2026-01-26
+
 ## [0.49.3] - 2026-01-22
 
 ## [0.49.2] - 2026-01-19

@@ -1,8 +1,9 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
-import { basename, dirname, isAbsolute, join, resolve } from "path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
+import type { ResourceDiagnostic } from "./diagnostics.js";
 
 /**
  * Standard frontmatter fields per Agent Skills spec.
@@ -15,6 +16,7 @@ const ALLOWED_FRONTMATTER_FIELDS = new Set([
 	"compatibility",
 	"metadata",
 	"allowed-tools",
+	"disable-model-invocation",
 ]);
 
 /** Max name length per spec */
@@ -26,6 +28,7 @@ const MAX_DESCRIPTION_LENGTH = 1024;
 export interface SkillFrontmatter {
 	name?: string;
 	description?: string;
+	"disable-model-invocation"?: boolean;
 	[key: string]: unknown;
 }
 
@@ -35,16 +38,12 @@ export interface Skill {
 	filePath: string;
 	baseDir: string;
 	source: string;
-}
-
-export interface SkillWarning {
-	skillPath: string;
-	message: string;
+	disableModelInvocation: boolean;
 }
 
 export interface LoadSkillsResult {
 	skills: Skill[];
-	warnings: SkillWarning[];
+	diagnostics: ResourceDiagnostic[];
 }
 
 /**
@@ -126,10 +125,10 @@ export function loadSkillsFromDir(options: LoadSkillsFromDirOptions): LoadSkills
 
 function loadSkillsFromDirInternal(dir: string, source: string, includeRootFiles: boolean): LoadSkillsResult {
 	const skills: Skill[] = [];
-	const warnings: SkillWarning[] = [];
+	const diagnostics: ResourceDiagnostic[] = [];
 
 	if (!existsSync(dir)) {
-		return { skills, warnings };
+		return { skills, diagnostics };
 	}
 
 	try {
@@ -164,7 +163,7 @@ function loadSkillsFromDirInternal(dir: string, source: string, includeRootFiles
 			if (isDirectory) {
 				const subResult = loadSkillsFromDirInternal(fullPath, source, false);
 				skills.push(...subResult.skills);
-				warnings.push(...subResult.warnings);
+				diagnostics.push(...subResult.diagnostics);
 				continue;
 			}
 
@@ -182,15 +181,18 @@ function loadSkillsFromDirInternal(dir: string, source: string, includeRootFiles
 			if (result.skill) {
 				skills.push(result.skill);
 			}
-			warnings.push(...result.warnings);
+			diagnostics.push(...result.diagnostics);
 		}
 	} catch {}
 
-	return { skills, warnings };
+	return { skills, diagnostics };
 }
 
-function loadSkillFromFile(filePath: string, source: string): { skill: Skill | null; warnings: SkillWarning[] } {
-	const warnings: SkillWarning[] = [];
+function loadSkillFromFile(
+	filePath: string,
+	source: string,
+): { skill: Skill | null; diagnostics: ResourceDiagnostic[] } {
+	const diagnostics: ResourceDiagnostic[] = [];
 
 	try {
 		const rawContent = readFileSync(filePath, "utf-8");
@@ -202,13 +204,13 @@ function loadSkillFromFile(filePath: string, source: string): { skill: Skill | n
 		// Validate frontmatter fields
 		const fieldErrors = validateFrontmatterFields(allKeys);
 		for (const error of fieldErrors) {
-			warnings.push({ skillPath: filePath, message: error });
+			diagnostics.push({ type: "warning", message: error, path: filePath });
 		}
 
 		// Validate description
 		const descErrors = validateDescription(frontmatter.description);
 		for (const error of descErrors) {
-			warnings.push({ skillPath: filePath, message: error });
+			diagnostics.push({ type: "warning", message: error, path: filePath });
 		}
 
 		// Use name from frontmatter, or fall back to parent directory name
@@ -217,12 +219,12 @@ function loadSkillFromFile(filePath: string, source: string): { skill: Skill | n
 		// Validate name
 		const nameErrors = validateName(name, parentDirName);
 		for (const error of nameErrors) {
-			warnings.push({ skillPath: filePath, message: error });
+			diagnostics.push({ type: "warning", message: error, path: filePath });
 		}
 
 		// Still load the skill even with warnings (unless description is completely missing)
 		if (!frontmatter.description || frontmatter.description.trim() === "") {
-			return { skill: null, warnings };
+			return { skill: null, diagnostics };
 		}
 
 		return {
@@ -232,13 +234,14 @@ function loadSkillFromFile(filePath: string, source: string): { skill: Skill | n
 				filePath,
 				baseDir: skillDir,
 				source,
+				disableModelInvocation: frontmatter["disable-model-invocation"] === true,
 			},
-			warnings,
+			diagnostics,
 		};
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "failed to parse skill file";
-		warnings.push({ skillPath: filePath, message });
-		return { skill: null, warnings };
+		diagnostics.push({ type: "warning", message, path: filePath });
+		return { skill: null, diagnostics };
 	}
 }
 
@@ -246,9 +249,14 @@ function loadSkillFromFile(filePath: string, source: string): { skill: Skill | n
  * Format skills for inclusion in a system prompt.
  * Uses XML format per Agent Skills standard.
  * See: https://agentskills.io/integrate-skills
+ *
+ * Skills with disableModelInvocation=true are excluded from the prompt
+ * (they can only be invoked explicitly via /skill:name commands).
  */
 export function formatSkillsForPrompt(skills: Skill[]): string {
-	if (skills.length === 0) {
+	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
+
+	if (visibleSkills.length === 0) {
 		return "";
 	}
 
@@ -259,7 +267,7 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 		"<available_skills>",
 	];
 
-	for (const skill of skills) {
+	for (const skill of visibleSkills) {
 		lines.push("  <skill>");
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
@@ -288,6 +296,8 @@ export interface LoadSkillsOptions {
 	agentDir?: string;
 	/** Explicit skill paths (files or directories) */
 	skillPaths?: string[];
+	/** Include default skills directories. Default: true */
+	includeDefaults?: boolean;
 }
 
 function normalizePath(input: string): string {
@@ -305,21 +315,21 @@ function resolveSkillPath(p: string, cwd: string): string {
 
 /**
  * Load skills from all configured locations.
- * Returns skills and any validation warnings.
+ * Returns skills and any validation diagnostics.
  */
 export function loadSkills(options: LoadSkillsOptions = {}): LoadSkillsResult {
-	const { cwd = process.cwd(), agentDir, skillPaths = [] } = options;
+	const { cwd = process.cwd(), agentDir, skillPaths = [], includeDefaults = true } = options;
 
 	// Resolve agentDir - if not provided, use default from config
 	const resolvedAgentDir = agentDir ?? getAgentDir();
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
-	const allWarnings: SkillWarning[] = [];
-	const collisionWarnings: SkillWarning[] = [];
+	const allDiagnostics: ResourceDiagnostic[] = [];
+	const collisionDiagnostics: ResourceDiagnostic[] = [];
 
 	function addSkills(result: LoadSkillsResult) {
-		allWarnings.push(...result.warnings);
+		allDiagnostics.push(...result.diagnostics);
 		for (const skill of result.skills) {
 			// Resolve symlinks to detect duplicate files
 			let realPath: string;
@@ -336,9 +346,16 @@ export function loadSkills(options: LoadSkillsOptions = {}): LoadSkillsResult {
 
 			const existing = skillMap.get(skill.name);
 			if (existing) {
-				collisionWarnings.push({
-					skillPath: skill.filePath,
-					message: `name collision: "${skill.name}" already loaded from ${existing.filePath}, skipping this one`,
+				collisionDiagnostics.push({
+					type: "collision",
+					message: `name "${skill.name}" collision`,
+					path: skill.filePath,
+					collision: {
+						resourceType: "skill",
+						name: skill.name,
+						winnerPath: existing.filePath,
+						loserPath: skill.filePath,
+					},
 				});
 			} else {
 				skillMap.set(skill.name, skill);
@@ -347,38 +364,61 @@ export function loadSkills(options: LoadSkillsOptions = {}): LoadSkillsResult {
 		}
 	}
 
-	addSkills(loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true));
-	addSkills(loadSkillsFromDirInternal(resolve(cwd, CONFIG_DIR_NAME, "skills"), "project", true));
+	if (includeDefaults) {
+		addSkills(loadSkillsFromDirInternal(join(resolvedAgentDir, "skills"), "user", true));
+		addSkills(loadSkillsFromDirInternal(resolve(cwd, CONFIG_DIR_NAME, "skills"), "project", true));
+	}
+
+	const userSkillsDir = join(resolvedAgentDir, "skills");
+	const projectSkillsDir = resolve(cwd, CONFIG_DIR_NAME, "skills");
+
+	const isUnderPath = (target: string, root: string): boolean => {
+		const normalizedRoot = resolve(root);
+		if (target === normalizedRoot) {
+			return true;
+		}
+		const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
+		return target.startsWith(prefix);
+	};
+
+	const getSource = (resolvedPath: string): "user" | "project" | "path" => {
+		if (!includeDefaults) {
+			if (isUnderPath(resolvedPath, userSkillsDir)) return "user";
+			if (isUnderPath(resolvedPath, projectSkillsDir)) return "project";
+		}
+		return "path";
+	};
 
 	for (const rawPath of skillPaths) {
 		const resolvedPath = resolveSkillPath(rawPath, cwd);
 		if (!existsSync(resolvedPath)) {
-			allWarnings.push({ skillPath: resolvedPath, message: "skill path does not exist" });
+			allDiagnostics.push({ type: "warning", message: "skill path does not exist", path: resolvedPath });
 			continue;
 		}
 
 		try {
 			const stats = statSync(resolvedPath);
+			const source = getSource(resolvedPath);
 			if (stats.isDirectory()) {
-				addSkills(loadSkillsFromDirInternal(resolvedPath, "custom", true));
+				addSkills(loadSkillsFromDirInternal(resolvedPath, source, true));
 			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
-				const result = loadSkillFromFile(resolvedPath, "custom");
+				const result = loadSkillFromFile(resolvedPath, source);
 				if (result.skill) {
-					addSkills({ skills: [result.skill], warnings: result.warnings });
+					addSkills({ skills: [result.skill], diagnostics: result.diagnostics });
 				} else {
-					allWarnings.push(...result.warnings);
+					allDiagnostics.push(...result.diagnostics);
 				}
 			} else {
-				allWarnings.push({ skillPath: resolvedPath, message: "skill path is not a markdown file" });
+				allDiagnostics.push({ type: "warning", message: "skill path is not a markdown file", path: resolvedPath });
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "failed to read skill path";
-			allWarnings.push({ skillPath: resolvedPath, message });
+			allDiagnostics.push({ type: "warning", message, path: resolvedPath });
 		}
 	}
 
 	return {
 		skills: Array.from(skillMap.values()),
-		warnings: [...allWarnings, ...collisionWarnings],
+		diagnostics: [...allDiagnostics, ...collisionDiagnostics],
 	};
 }

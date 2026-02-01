@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import { homedir } from "os";
-import { basename, isAbsolute, join, resolve } from "path";
+import { basename, isAbsolute, join, resolve, sep } from "path";
 import { CONFIG_DIR_NAME, getPromptsDir } from "../config.js";
 import { parseFrontmatter } from "../utils/frontmatter.js";
 
@@ -11,7 +11,8 @@ export interface PromptTemplate {
 	name: string;
 	description: string;
 	content: string;
-	source: string; // e.g., "(user)", "(project)", "(custom:my-dir)"
+	source: string; // "user", "project", or "path"
+	filePath: string; // Absolute path to the template file
 }
 
 /**
@@ -98,7 +99,7 @@ export function substituteArgs(content: string, args: string[]): string {
 	return result;
 }
 
-function loadTemplateFromFile(filePath: string, sourceLabel: string): PromptTemplate | null {
+function loadTemplateFromFile(filePath: string, source: string, sourceLabel: string): PromptTemplate | null {
 	try {
 		const rawContent = readFileSync(filePath, "utf-8");
 		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(rawContent);
@@ -123,7 +124,8 @@ function loadTemplateFromFile(filePath: string, sourceLabel: string): PromptTemp
 			name,
 			description,
 			content: body,
-			source: sourceLabel,
+			source,
+			filePath,
 		};
 	} catch {
 		return null;
@@ -133,7 +135,7 @@ function loadTemplateFromFile(filePath: string, sourceLabel: string): PromptTemp
 /**
  * Scan a directory for .md files (non-recursive) and load them as prompt templates.
  */
-function loadTemplatesFromDir(dir: string, sourceLabel: string): PromptTemplate[] {
+function loadTemplatesFromDir(dir: string, source: string, sourceLabel: string): PromptTemplate[] {
 	const templates: PromptTemplate[] = [];
 
 	if (!existsSync(dir)) {
@@ -159,7 +161,7 @@ function loadTemplatesFromDir(dir: string, sourceLabel: string): PromptTemplate[
 			}
 
 			if (isFile && entry.name.endsWith(".md")) {
-				const template = loadTemplateFromFile(fullPath, sourceLabel);
+				const template = loadTemplateFromFile(fullPath, source, sourceLabel);
 				if (template) {
 					templates.push(template);
 				}
@@ -179,6 +181,8 @@ export interface LoadPromptTemplatesOptions {
 	agentDir?: string;
 	/** Explicit prompt template paths (files or directories) */
 	promptPaths?: string[];
+	/** Include default prompt directories. Default: true */
+	includeDefaults?: boolean;
 }
 
 function normalizePath(input: string): string {
@@ -194,9 +198,9 @@ function resolvePromptPath(p: string, cwd: string): string {
 	return isAbsolute(normalized) ? normalized : resolve(cwd, normalized);
 }
 
-function buildCustomSourceLabel(p: string): string {
-	const base = basename(p).replace(/\.md$/, "") || "custom";
-	return `(custom:${base})`;
+function buildPathSourceLabel(p: string): string {
+	const base = basename(p).replace(/\.md$/, "") || "path";
+	return `(path:${base})`;
 }
 
 /**
@@ -209,17 +213,44 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions = {}): P
 	const resolvedCwd = options.cwd ?? process.cwd();
 	const resolvedAgentDir = options.agentDir ?? getPromptsDir();
 	const promptPaths = options.promptPaths ?? [];
+	const includeDefaults = options.includeDefaults ?? true;
 
 	const templates: PromptTemplate[] = [];
 
-	// 1. Load global templates from agentDir/prompts/
-	// Note: if agentDir is provided, it should be the agent dir, not the prompts dir
-	const globalPromptsDir = options.agentDir ? join(options.agentDir, "prompts") : resolvedAgentDir;
-	templates.push(...loadTemplatesFromDir(globalPromptsDir, "(user)"));
+	if (includeDefaults) {
+		// 1. Load global templates from agentDir/prompts/
+		// Note: if agentDir is provided, it should be the agent dir, not the prompts dir
+		const globalPromptsDir = options.agentDir ? join(options.agentDir, "prompts") : resolvedAgentDir;
+		templates.push(...loadTemplatesFromDir(globalPromptsDir, "user", "(user)"));
 
-	// 2. Load project templates from cwd/{CONFIG_DIR_NAME}/prompts/
+		// 2. Load project templates from cwd/{CONFIG_DIR_NAME}/prompts/
+		const projectPromptsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "prompts");
+		templates.push(...loadTemplatesFromDir(projectPromptsDir, "project", "(project)"));
+	}
+
+	const userPromptsDir = options.agentDir ? join(options.agentDir, "prompts") : resolvedAgentDir;
 	const projectPromptsDir = resolve(resolvedCwd, CONFIG_DIR_NAME, "prompts");
-	templates.push(...loadTemplatesFromDir(projectPromptsDir, "(project)"));
+
+	const isUnderPath = (target: string, root: string): boolean => {
+		const normalizedRoot = resolve(root);
+		if (target === normalizedRoot) {
+			return true;
+		}
+		const prefix = normalizedRoot.endsWith(sep) ? normalizedRoot : `${normalizedRoot}${sep}`;
+		return target.startsWith(prefix);
+	};
+
+	const getSourceInfo = (resolvedPath: string): { source: string; label: string } => {
+		if (!includeDefaults) {
+			if (isUnderPath(resolvedPath, userPromptsDir)) {
+				return { source: "user", label: "(user)" };
+			}
+			if (isUnderPath(resolvedPath, projectPromptsDir)) {
+				return { source: "project", label: "(project)" };
+			}
+		}
+		return { source: "path", label: buildPathSourceLabel(resolvedPath) };
+	};
 
 	// 3. Load explicit prompt paths
 	for (const rawPath of promptPaths) {
@@ -230,10 +261,11 @@ export function loadPromptTemplates(options: LoadPromptTemplatesOptions = {}): P
 
 		try {
 			const stats = statSync(resolvedPath);
+			const { source, label } = getSourceInfo(resolvedPath);
 			if (stats.isDirectory()) {
-				templates.push(...loadTemplatesFromDir(resolvedPath, buildCustomSourceLabel(resolvedPath)));
+				templates.push(...loadTemplatesFromDir(resolvedPath, source, label));
 			} else if (stats.isFile() && resolvedPath.endsWith(".md")) {
-				const template = loadTemplateFromFile(resolvedPath, buildCustomSourceLabel(resolvedPath));
+				const template = loadTemplateFromFile(resolvedPath, source, label);
 				if (template) {
 					templates.push(template);
 				}

@@ -14,6 +14,7 @@
  */
 
 import { readFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type {
 	Agent,
 	AgentEvent,
@@ -23,10 +24,11 @@ import type {
 	ThinkingLevel,
 } from "@mariozechner/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
-import { isContextOverflow, modelsAreEqual, supportsXhigh } from "@mariozechner/pi-ai";
-import { getAuthPath } from "../config.js";
+import { isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@mariozechner/pi-ai";
+import { getDocsPath } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
+import { sleep } from "../utils/sleep.js";
 import { type BashResult, executeBash as executeBashCommand, executeBashWithOperations } from "./bash-executor.js";
 import {
 	type CompactionResult,
@@ -62,13 +64,39 @@ import {
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
-import type { ResourceLoader } from "./resource-loader.js";
-import type { BranchSummaryEntry, CompactionEntry, NewSessionOptions, SessionManager } from "./session-manager.js";
+import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
+import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
-import type { Skill, SkillWarning } from "./skills.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import type { BashOperations } from "./tools/bash.js";
 import { createAllTools } from "./tools/index.js";
+
+// ============================================================================
+// Skill Block Parsing
+// ============================================================================
+
+/** Parsed skill block from a user message */
+export interface ParsedSkillBlock {
+	name: string;
+	location: string;
+	content: string;
+	userMessage: string | undefined;
+}
+
+/**
+ * Parse a skill block from message text.
+ * Returns null if the text doesn't contain a skill block.
+ */
+export function parseSkillBlock(text: string): ParsedSkillBlock | null {
+	const match = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
+	if (!match) return null;
+	return {
+		name: match[1],
+		location: match[2],
+		content: match[3],
+		userMessage: match[4]?.trim() || undefined,
+	};
+}
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
@@ -221,8 +249,8 @@ export class AgentSession {
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionShutdownHandler?: ShutdownHandler;
-	private _extensionErrorListeners = new Set<ExtensionErrorListener>();
-	private _extensionErrorUnsubscribers: Array<() => void> = [];
+	private _extensionErrorListener?: ExtensionErrorListener;
+	private _extensionErrorUnsubscriber?: () => void;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -326,6 +354,19 @@ export class AgentSession {
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+
+				// Reset retry counter immediately on successful assistant response
+				// This prevents accumulation across multiple LLM calls within a turn
+				const assistantMsg = event.message as AssistantMessage;
+				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+					this._emit({
+						type: "auto_retry_end",
+						success: true,
+						attempt: this._retryAttempt,
+					});
+					this._retryAttempt = 0;
+					this._resolveRetry();
+				}
 			}
 		}
 
@@ -338,16 +379,6 @@ export class AgentSession {
 			if (this._isRetryableError(msg)) {
 				const didRetry = await this._handleRetryableError(msg);
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
-			} else if (this._retryAttempt > 0) {
-				// Previous retry succeeded - emit success event and reset counter
-				this._emit({
-					type: "auto_retry_end",
-					success: true,
-					attempt: this._retryAttempt,
-				});
-				this._retryAttempt = 0;
-				// Resolve the retry promise so waitForRetry() completes
-				this._resolveRetry();
 			}
 
 			await this._checkCompaction(msg);
@@ -483,6 +514,11 @@ export class AgentSession {
 		return this.agent.state.isStreaming;
 	}
 
+	/** Current effective system prompt (includes any per-turn extension modifications) */
+	get systemPrompt(): string {
+		return this.agent.state.systemPrompt;
+	}
+
 	/** Current retry attempt (0 if not retrying) */
 	get retryAttempt(): number {
 		return this._retryAttempt;
@@ -557,6 +593,11 @@ export class AgentSession {
 	/** Current session ID */
 	get sessionId(): string {
 		return this.sessionManager.getSessionId();
+	}
+
+	/** Current session display name, if set */
+	get sessionName(): string | undefined {
+		return this.sessionManager.getSessionName();
 	}
 
 	/** Scoped models for cycling (from --models flag) */
@@ -666,7 +707,7 @@ export class AgentSession {
 		if (!this.model) {
 			throw new Error(
 				"No model selected.\n\n" +
-					`Use /login, set an API key environment variable, or create ${getAuthPath()}\n\n` +
+					`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}\n\n` +
 					"Then use /model to select a model.",
 			);
 		}
@@ -684,7 +725,7 @@ export class AgentSession {
 			}
 			throw new Error(
 				`No API key found for ${this.model.provider}.\n\n` +
-					`Use /login, set an API key environment variable, or create ${getAuthPath()}`,
+					`Use /login or set an API key environment variable. See ${join(getDocsPath(), "providers.md")}`,
 			);
 		}
 
@@ -790,15 +831,14 @@ export class AgentSession {
 		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
 
-		const skill = this.skills.find((s) => s.name === skillName);
+		const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
 		if (!skill) return text; // Unknown skill, pass through
 
 		try {
 			const content = readFileSync(skill.filePath, "utf-8");
 			const body = stripFrontmatter(content).trim();
-			const header = `Skill location: ${skill.filePath}\nReferences are relative to ${skill.baseDir}.`;
-			const skillMessage = `${header}\n\n${body}`;
-			return args ? `${skillMessage}\n\n---\n\nUser: ${args}` : skillMessage;
+			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+			return args ? `${skillBlock}\n\n${args}` : skillBlock;
 		} catch (err) {
 			// Emit error like extension commands do
 			this._extensionRunner?.emitError({
@@ -1005,19 +1045,6 @@ export class AgentSession {
 		return this._followUpMessages;
 	}
 
-	/** Skills loaded by resource loader */
-	get skills(): readonly Skill[] {
-		return this._resourceLoader.getSkills().skills;
-	}
-
-	/** Skill loading warnings captured by resource loader */
-	get skillWarnings(): readonly SkillWarning[] {
-		return this._resourceLoader.getSkills().diagnostics.map((diagnostic) => ({
-			skillPath: diagnostic.path ?? "<unknown>",
-			message: diagnostic.message,
-		}));
-	}
-
 	get resourceLoader(): ResourceLoader {
 		return this._resourceLoader;
 	}
@@ -1035,10 +1062,14 @@ export class AgentSession {
 	 * Start a new session, optionally with initial messages and parent tracking.
 	 * Clears all messages and starts a new session.
 	 * Listeners are preserved and will continue receiving events.
-	 * @param options - Optional initial messages and parent session path
+	 * @param options.parentSession - Optional parent session path for tracking
+	 * @param options.setup - Optional callback to initialize session (e.g., append messages)
 	 * @returns true if completed, false if cancelled by extension
 	 */
-	async newSession(options?: NewSessionOptions): Promise<boolean> {
+	async newSession(options?: {
+		parentSession?: string;
+		setup?: (sessionManager: SessionManager) => Promise<void>;
+	}): Promise<boolean> {
 		const previousSessionFile = this.sessionFile;
 
 		// Emit session_before_switch event with reason "new" (can be cancelled)
@@ -1056,11 +1087,20 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		await this.abort();
 		this.agent.reset();
-		this.sessionManager.newSession(options);
+		this.sessionManager.newSession({ parentSession: options?.parentSession });
 		this.agent.sessionId = this.sessionManager.getSessionId();
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this._pendingNextTurnMessages = [];
+
+		// Run setup callback if provided (e.g., to append initial messages)
+		if (options?.setup) {
+			await options.setup(this.sessionManager);
+			// Sync agent state with session manager after setup
+			const sessionContext = this.sessionManager.buildSessionContext();
+			this.agent.replaceMessages(sessionContext.messages);
+		}
+
 		this._reconnectToAgent();
 
 		// Emit session_switch event with reason "new" to extensions
@@ -1189,13 +1229,6 @@ export class AgentSession {
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
 
-	/**
-	 * Get all available models with valid API keys.
-	 */
-	async getAvailableModels(): Promise<Model<any>[]> {
-		return this._modelRegistry.getAvailable();
-	}
-
 	// =========================================================================
 	// Thinking Level Management
 	// =========================================================================
@@ -1203,14 +1236,21 @@ export class AgentSession {
 	/**
 	 * Set thinking level.
 	 * Clamps to model capabilities based on available thinking levels.
-	 * Saves to session and settings.
+	 * Saves to session and settings only if the level actually changes.
 	 */
 	setThinkingLevel(level: ThinkingLevel): void {
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+
+		// Only persist if actually changing
+		const isChanging = effectiveLevel !== this.agent.state.thinkingLevel;
+
 		this.agent.setThinkingLevel(effectiveLevel);
-		this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-		this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+
+		if (isChanging) {
+			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
+		}
 	}
 
 	/**
@@ -1643,27 +1683,78 @@ export class AgentSession {
 		if (bindings.shutdownHandler !== undefined) {
 			this._extensionShutdownHandler = bindings.shutdownHandler;
 		}
-		if (bindings.onError) {
-			this._extensionErrorListeners.add(bindings.onError);
+		if (bindings.onError !== undefined) {
+			this._extensionErrorListener = bindings.onError;
 		}
 
 		if (this._extensionRunner) {
 			this._applyExtensionBindings(this._extensionRunner);
 			await this._extensionRunner.emit({ type: "session_start" });
+			await this.extendResourcesFromExtensions("startup");
 		}
+	}
+
+	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
+		if (!this._extensionRunner?.hasHandlers("resources_discover")) {
+			return;
+		}
+
+		const { skillPaths, promptPaths, themePaths } = await this._extensionRunner.emitResourcesDiscover(
+			this._cwd,
+			reason,
+		);
+
+		if (skillPaths.length === 0 && promptPaths.length === 0 && themePaths.length === 0) {
+			return;
+		}
+
+		const extensionPaths: ResourceExtensionPaths = {
+			skillPaths: this.buildExtensionResourcePaths(skillPaths),
+			promptPaths: this.buildExtensionResourcePaths(promptPaths),
+			themePaths: this.buildExtensionResourcePaths(themePaths),
+		};
+
+		this._resourceLoader.extendResources(extensionPaths);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.setSystemPrompt(this._baseSystemPrompt);
+	}
+
+	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{
+		path: string;
+		metadata: { source: string; scope: "temporary"; origin: "top-level"; baseDir?: string };
+	}> {
+		return entries.map((entry) => {
+			const source = this.getExtensionSourceLabel(entry.extensionPath);
+			const baseDir = entry.extensionPath.startsWith("<") ? undefined : dirname(entry.extensionPath);
+			return {
+				path: entry.path,
+				metadata: {
+					source,
+					scope: "temporary",
+					origin: "top-level",
+					baseDir,
+				},
+			};
+		});
+	}
+
+	private getExtensionSourceLabel(extensionPath: string): string {
+		if (extensionPath.startsWith("<")) {
+			return `extension:${extensionPath.replace(/[<>]/g, "")}`;
+		}
+		const base = basename(extensionPath);
+		const name = base.replace(/\.(ts|js)$/, "");
+		return `extension:${name}`;
 	}
 
 	private _applyExtensionBindings(runner: ExtensionRunner): void {
 		runner.setUIContext(this._extensionUIContext);
 		runner.bindCommandContext(this._extensionCommandContextActions);
 
-		for (const unsubscribe of this._extensionErrorUnsubscribers) {
-			unsubscribe();
-		}
-		this._extensionErrorUnsubscribers = [];
-		for (const listener of this._extensionErrorListeners) {
-			this._extensionErrorUnsubscribers.push(runner.onError(listener));
-		}
+		this._extensionErrorUnsubscriber?.();
+		this._extensionErrorUnsubscriber = this._extensionErrorListener
+			? runner.onError(this._extensionErrorListener)
+			: undefined;
 	}
 
 	private _bindExtensionCore(runner: ExtensionRunner): void {
@@ -1731,6 +1822,7 @@ export class AgentSession {
 						}
 					})();
 				},
+				getSystemPrompt: () => this.systemPrompt,
 			},
 		);
 	}
@@ -1829,6 +1921,7 @@ export class AgentSession {
 	async reload(): Promise<void> {
 		const previousFlagValues = this._extensionRunner?.getFlagValues();
 		await this._extensionRunner?.emit({ type: "session_shutdown" });
+		resetApiProviders();
 		await this._resourceLoader.reload();
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),
@@ -1840,9 +1933,10 @@ export class AgentSession {
 			this._extensionUIContext ||
 			this._extensionCommandContextActions ||
 			this._extensionShutdownHandler ||
-			this._extensionErrorListeners.size > 0;
+			this._extensionErrorListener;
 		if (this._extensionRunner && hasBindings) {
 			await this._extensionRunner.emit({ type: "session_start" });
+			await this.extendResourcesFromExtensions("reload");
 		}
 	}
 
@@ -1862,8 +1956,8 @@ export class AgentSession {
 		if (isContextOverflow(message, contextWindow)) return false;
 
 		const err = message.errorMessage;
-		// Match: overloaded_error, rate limit, 429, 500, 502, 503, 504, service unavailable, connection errors, fetch failed
-		return /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers/i.test(
+		// Match: overloaded_error, rate limit, 429, 500, 502, 503, 504, service unavailable, connection errors, fetch failed, terminated, retry delay exceeded
+		return /overloaded|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server error|internal error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|terminated|retry delay/i.test(
 			err,
 		);
 	}
@@ -1917,7 +2011,7 @@ export class AgentSession {
 		// Wait with exponential backoff (abortable)
 		this._retryAbortController = new AbortController();
 		try {
-			await this._sleep(delayMs, this._retryAbortController.signal);
+			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this._retryAttempt;
@@ -1942,25 +2036,6 @@ export class AgentSession {
 		}, 0);
 
 		return true;
-	}
-
-	/**
-	 * Sleep helper that respects abort signal.
-	 */
-	private _sleep(ms: number, signal?: AbortSignal): Promise<void> {
-		return new Promise((resolve, reject) => {
-			if (signal?.aborted) {
-				reject(new Error("Aborted"));
-				return;
-			}
-
-			const timeout = setTimeout(resolve, ms);
-
-			signal?.addEventListener("abort", () => {
-				clearTimeout(timeout);
-				reject(new Error("Aborted"));
-			});
-		});
 	}
 
 	/**
@@ -2177,6 +2252,13 @@ export class AgentSession {
 
 		this._reconnectToAgent();
 		return true;
+	}
+
+	/**
+	 * Set a display name for the current session.
+	 */
+	setSessionName(name: string): void {
+		this.sessionManager.appendSessionInfo(name);
 	}
 
 	/**

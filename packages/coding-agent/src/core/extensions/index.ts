@@ -76,10 +76,16 @@ export type {
 	MessageRenderOptions,
 	ModelSelectEvent,
 	ModelSelectSource,
+	// Provider Registration
+	ProviderConfig,
+	ProviderModelConfig,
 	ReadToolResultEvent,
 	// Commands
 	RegisteredCommand,
 	RegisteredTool,
+	// Events - Resources
+	ResourcesDiscoverEvent,
+	ResourcesDiscoverResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
 	SessionBeforeCompactEvent,

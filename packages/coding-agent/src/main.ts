@@ -9,11 +9,13 @@ import { type ImageContent, modelsAreEqual, supportsXhigh } from "@mariozechner/
 import chalk from "chalk";
 import { createInterface } from "readline";
 import { type Args, parseArgs, printHelp } from "./cli/args.js";
+import { selectConfig } from "./cli/config-selector.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
 import { getAgentDir, getModelsPath, VERSION } from "./config.js";
 import { AuthStorage } from "./core/auth-storage.js";
+import { DEFAULT_THINKING_LEVEL } from "./core/defaults.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { LoadExtensionsResult } from "./core/extensions/index.js";
 import { KeybindingsManager } from "./core/keybindings.js";
@@ -23,7 +25,7 @@ import { DefaultPackageManager } from "./core/package-manager.js";
 import { DefaultResourceLoader } from "./core/resource-loader.js";
 import { type CreateAgentSessionOptions, createAgentSession } from "./core/sdk.js";
 import { SessionManager } from "./core/session-manager.js";
-import { SettingsManager } from "./core/settings-manager.js";
+import { type PackageSource, SettingsManager } from "./core/settings-manager.js";
 import { printTimings, time } from "./core/timings.js";
 import { allTools } from "./core/tools/index.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
@@ -104,27 +106,36 @@ function sourcesMatch(a: string, b: string): boolean {
 	return left.type === right.type && left.key === right.key;
 }
 
-function updateExtensionSources(
+function getPackageSourceString(pkg: PackageSource): string {
+	return typeof pkg === "string" ? pkg : pkg.source;
+}
+
+function packageSourcesMatch(a: PackageSource, b: string): boolean {
+	const aSource = getPackageSourceString(a);
+	return sourcesMatch(aSource, b);
+}
+
+function updatePackageSources(
 	settingsManager: SettingsManager,
 	source: string,
 	local: boolean,
 	action: "add" | "remove",
 ): void {
 	const currentSettings = local ? settingsManager.getProjectSettings() : settingsManager.getGlobalSettings();
-	const currentSources = currentSettings.extensions ?? [];
+	const currentPackages = currentSettings.packages ?? [];
 
-	let nextSources: string[];
+	let nextPackages: PackageSource[];
 	if (action === "add") {
-		const exists = currentSources.some((existing) => sourcesMatch(existing, source));
-		nextSources = exists ? currentSources : [...currentSources, source];
+		const exists = currentPackages.some((existing) => packageSourcesMatch(existing, source));
+		nextPackages = exists ? currentPackages : [...currentPackages, source];
 	} else {
-		nextSources = currentSources.filter((existing) => !sourcesMatch(existing, source));
+		nextPackages = currentPackages.filter((existing) => !packageSourcesMatch(existing, source));
 	}
 
 	if (local) {
-		settingsManager.setProjectExtensionPaths(nextSources);
+		settingsManager.setProjectPackages(nextPackages);
 	} else {
-		settingsManager.setExtensionPaths(nextSources);
+		settingsManager.setPackages(nextPackages);
 	}
 }
 
@@ -154,7 +165,7 @@ async function handlePackageCommand(args: string[]): Promise<boolean> {
 			process.exit(1);
 		}
 		await packageManager.install(options.source, { local: options.local });
-		updateExtensionSources(settingsManager, options.source, options.local, "add");
+		updatePackageSources(settingsManager, options.source, options.local, "add");
 		console.log(chalk.green(`Installed ${options.source}`));
 		return true;
 	}
@@ -165,7 +176,7 @@ async function handlePackageCommand(args: string[]): Promise<boolean> {
 			process.exit(1);
 		}
 		await packageManager.remove(options.source, { local: options.local });
-		updateExtensionSources(settingsManager, options.source, options.local, "remove");
+		updatePackageSources(settingsManager, options.source, options.local, "remove");
 		console.log(chalk.green(`Removed ${options.source}`));
 		return true;
 	}
@@ -173,26 +184,38 @@ async function handlePackageCommand(args: string[]): Promise<boolean> {
 	if (options.command === "list") {
 		const globalSettings = settingsManager.getGlobalSettings();
 		const projectSettings = settingsManager.getProjectSettings();
-		const globalExtensions = globalSettings.extensions ?? [];
-		const projectExtensions = projectSettings.extensions ?? [];
+		const globalPackages = globalSettings.packages ?? [];
+		const projectPackages = projectSettings.packages ?? [];
 
-		if (globalExtensions.length === 0 && projectExtensions.length === 0) {
-			console.log(chalk.dim("No extensions installed."));
+		if (globalPackages.length === 0 && projectPackages.length === 0) {
+			console.log(chalk.dim("No packages installed."));
 			return true;
 		}
 
-		if (globalExtensions.length > 0) {
-			console.log(chalk.bold("Global extensions:"));
-			for (const ext of globalExtensions) {
-				console.log(`  ${ext}`);
+		const formatPackage = (pkg: (typeof globalPackages)[number], scope: "user" | "project") => {
+			const source = typeof pkg === "string" ? pkg : pkg.source;
+			const filtered = typeof pkg === "object";
+			const display = filtered ? `${source} (filtered)` : source;
+			console.log(`  ${display}`);
+			// Show resolved path
+			const path = packageManager.getInstalledPath(source, scope);
+			if (path) {
+				console.log(chalk.dim(`    ${path}`));
+			}
+		};
+
+		if (globalPackages.length > 0) {
+			console.log(chalk.bold("User packages:"));
+			for (const pkg of globalPackages) {
+				formatPackage(pkg, "user");
 			}
 		}
 
-		if (projectExtensions.length > 0) {
-			if (globalExtensions.length > 0) console.log();
-			console.log(chalk.bold("Project extensions:"));
-			for (const ext of projectExtensions) {
-				console.log(`  ${ext}`);
+		if (projectPackages.length > 0) {
+			if (globalPackages.length > 0) console.log();
+			console.log(chalk.bold("Project packages:"));
+			for (const pkg of projectPackages) {
+				formatPackage(pkg, "project");
 			}
 		}
 
@@ -203,7 +226,7 @@ async function handlePackageCommand(args: string[]): Promise<boolean> {
 	if (options.source) {
 		console.log(chalk.green(`Updated ${options.source}`));
 	} else {
-		console.log(chalk.green("Updated extensions"));
+		console.log(chalk.green("Updated packages"));
 	}
 	return true;
 }
@@ -377,7 +400,7 @@ function buildSessionOptions(
 
 	// Scoped models for Ctrl+P cycling - fill in default thinking level for models without explicit level
 	if (scopedModels.length > 0) {
-		const defaultThinkingLevel = settingsManager.getDefaultThinkingLevel() ?? "off";
+		const defaultThinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
 		options.scopedModels = scopedModels.map((sm) => ({
 			model: sm.model,
 			thinkingLevel: sm.thinkingLevel ?? defaultThinkingLevel,
@@ -403,17 +426,39 @@ function buildSessionOptions(
 	return options;
 }
 
+async function handleConfigCommand(args: string[]): Promise<boolean> {
+	if (args[0] !== "config") {
+		return false;
+	}
+
+	const cwd = process.cwd();
+	const agentDir = getAgentDir();
+	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+
+	const resolvedPaths = await packageManager.resolve();
+
+	await selectConfig({
+		resolvedPaths,
+		settingsManager,
+		cwd,
+		agentDir,
+	});
+
+	process.exit(0);
+}
+
 export async function main(args: string[]) {
 	if (await handlePackageCommand(args)) {
 		return;
 	}
 
+	if (await handleConfigCommand(args)) {
+		return;
+	}
+
 	// Run migrations (pass cwd for project-local migrations)
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(process.cwd());
-
-	// Create AuthStorage and ModelRegistry upfront
-	const authStorage = new AuthStorage();
-	const modelRegistry = new ModelRegistry(authStorage);
 
 	// First pass: parse args to get --extension paths
 	const firstPass = parseArgs(args);
@@ -422,6 +467,8 @@ export async function main(args: string[]) {
 	const cwd = process.cwd();
 	const agentDir = getAgentDir();
 	const settingsManager = SettingsManager.create(cwd, agentDir);
+	const authStorage = new AuthStorage();
+	const modelRegistry = new ModelRegistry(authStorage, getModelsPath());
 
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
@@ -445,6 +492,13 @@ export async function main(args: string[]) {
 	for (const { path, error } of extensionsResult.errors) {
 		console.error(chalk.red(`Failed to load extension "${path}": ${error}`));
 	}
+
+	// Apply pending provider registrations from extensions immediately
+	// so they're available for model resolution before AgentSession is created
+	for (const { name, config } of extensionsResult.runtime.pendingProviderRegistrations) {
+		modelRegistry.registerProvider(name, config);
+	}
+	extensionsResult.runtime.pendingProviderRegistrations = [];
 
 	const extensionFlags = new Map<string, { type: "boolean" | "string" }>();
 	for (const ext of extensionsResult.extensions) {
@@ -582,7 +636,7 @@ export async function main(args: string[]) {
 	if (mode === "rpc") {
 		await runRpcMode(session);
 	} else if (isInteractive) {
-		if (scopedModels.length > 0 && !settingsManager.getQuietStartup()) {
+		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
 			const modelList = scopedModels
 				.map((sm) => {
 					const thinkingStr = sm.thinkingLevel ? `:${sm.thinkingLevel}` : "";
@@ -599,6 +653,7 @@ export async function main(args: string[]) {
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,
+			verbose: parsed.verbose,
 		});
 		await mode.run();
 	} else {

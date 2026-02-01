@@ -11,7 +11,7 @@ const segmenter = getSegmenter();
  * Represents a chunk of text for word-wrap layout.
  * Tracks both the text content and its position in the original line.
  */
-interface TextChunk {
+export interface TextChunk {
 	text: string;
 	startIndex: number;
 	endIndex: number;
@@ -26,7 +26,7 @@ interface TextChunk {
  * @param maxWidth - Maximum visible width per chunk
  * @returns Array of chunks with text and position information
  */
-function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
+export function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 	if (!line || maxWidth <= 0) {
 		return [{ text: "", startIndex: 0, endIndex: 0 }];
 	}
@@ -37,154 +37,56 @@ function wordWrapLine(line: string, maxWidth: number): TextChunk[] {
 	}
 
 	const chunks: TextChunk[] = [];
+	const segments = [...segmenter.segment(line)];
 
-	// Split into tokens (words and whitespace runs)
-	const tokens: { text: string; startIndex: number; endIndex: number; isWhitespace: boolean }[] = [];
-	let currentToken = "";
-	let tokenStart = 0;
-	let inWhitespace = false;
-	let charIndex = 0;
-
-	for (const seg of segmenter.segment(line)) {
-		const grapheme = seg.segment;
-		const graphemeIsWhitespace = isWhitespaceChar(grapheme);
-
-		if (currentToken === "") {
-			inWhitespace = graphemeIsWhitespace;
-			tokenStart = charIndex;
-		} else if (graphemeIsWhitespace !== inWhitespace) {
-			// Token type changed - save current token
-			tokens.push({
-				text: currentToken,
-				startIndex: tokenStart,
-				endIndex: charIndex,
-				isWhitespace: inWhitespace,
-			});
-			currentToken = "";
-			tokenStart = charIndex;
-			inWhitespace = graphemeIsWhitespace;
-		}
-
-		currentToken += grapheme;
-		charIndex += grapheme.length;
-	}
-
-	// Push final token
-	if (currentToken) {
-		tokens.push({
-			text: currentToken,
-			startIndex: tokenStart,
-			endIndex: charIndex,
-			isWhitespace: inWhitespace,
-		});
-	}
-
-	// Build chunks using word wrapping
-	let currentChunk = "";
 	let currentWidth = 0;
-	let chunkStartIndex = 0;
-	let atLineStart = true; // Track if we're at the start of a line (for skipping whitespace)
+	let chunkStart = 0;
 
-	for (const token of tokens) {
-		const tokenWidth = visibleWidth(token.text);
+	// Wrap opportunity: the position after the last whitespace before a non-whitespace
+	// grapheme, i.e. where a line break is allowed.
+	let wrapOppIndex = -1;
+	let wrapOppWidth = 0;
 
-		// Skip leading whitespace at line start
-		if (atLineStart && token.isWhitespace) {
-			chunkStartIndex = token.endIndex;
-			continue;
-		}
-		atLineStart = false;
+	for (let i = 0; i < segments.length; i++) {
+		const seg = segments[i]!;
+		const grapheme = seg.segment;
+		const gWidth = visibleWidth(grapheme);
+		const charIndex = seg.index;
+		const isWs = isWhitespaceChar(grapheme);
 
-		// If this single token is wider than maxWidth, we need to break it
-		if (tokenWidth > maxWidth) {
-			// First, push any accumulated chunk
-			if (currentChunk) {
-				chunks.push({
-					text: currentChunk,
-					startIndex: chunkStartIndex,
-					endIndex: token.startIndex,
-				});
-				currentChunk = "";
+		// Overflow check before advancing.
+		if (currentWidth + gWidth > maxWidth) {
+			if (wrapOppIndex >= 0) {
+				// Backtrack to last wrap opportunity.
+				chunks.push({ text: line.slice(chunkStart, wrapOppIndex), startIndex: chunkStart, endIndex: wrapOppIndex });
+				chunkStart = wrapOppIndex;
+				currentWidth -= wrapOppWidth;
+			} else if (chunkStart < charIndex) {
+				// No wrap opportunity: force-break at current position.
+				chunks.push({ text: line.slice(chunkStart, charIndex), startIndex: chunkStart, endIndex: charIndex });
+				chunkStart = charIndex;
 				currentWidth = 0;
-				chunkStartIndex = token.startIndex;
 			}
-
-			// Break the long token by grapheme
-			let tokenChunk = "";
-			let tokenChunkWidth = 0;
-			let tokenChunkStart = token.startIndex;
-			let tokenCharIndex = token.startIndex;
-
-			for (const seg of segmenter.segment(token.text)) {
-				const grapheme = seg.segment;
-				const graphemeWidth = visibleWidth(grapheme);
-
-				if (tokenChunkWidth + graphemeWidth > maxWidth && tokenChunk) {
-					chunks.push({
-						text: tokenChunk,
-						startIndex: tokenChunkStart,
-						endIndex: tokenCharIndex,
-					});
-					tokenChunk = grapheme;
-					tokenChunkWidth = graphemeWidth;
-					tokenChunkStart = tokenCharIndex;
-				} else {
-					tokenChunk += grapheme;
-					tokenChunkWidth += graphemeWidth;
-				}
-				tokenCharIndex += grapheme.length;
-			}
-
-			// Keep remainder as start of next chunk
-			if (tokenChunk) {
-				currentChunk = tokenChunk;
-				currentWidth = tokenChunkWidth;
-				chunkStartIndex = tokenChunkStart;
-			}
-			continue;
+			wrapOppIndex = -1;
 		}
 
-		// Check if adding this token would exceed width
-		if (currentWidth + tokenWidth > maxWidth) {
-			// Push current chunk (trimming trailing whitespace for display)
-			const trimmedChunk = currentChunk.trimEnd();
-			if (trimmedChunk || chunks.length === 0) {
-				chunks.push({
-					text: trimmedChunk,
-					startIndex: chunkStartIndex,
-					endIndex: chunkStartIndex + currentChunk.length,
-				});
-			}
+		// Advance.
+		currentWidth += gWidth;
 
-			// Start new line - skip leading whitespace
-			atLineStart = true;
-			if (token.isWhitespace) {
-				currentChunk = "";
-				currentWidth = 0;
-				chunkStartIndex = token.endIndex;
-			} else {
-				currentChunk = token.text;
-				currentWidth = tokenWidth;
-				chunkStartIndex = token.startIndex;
-				atLineStart = false;
-			}
-		} else {
-			// Add token to current chunk
-			currentChunk += token.text;
-			currentWidth += tokenWidth;
+		// Record wrap opportunity: whitespace followed by non-whitespace.
+		// Multiple spaces join (no break between them); the break point is
+		// after the last space before the next word.
+		const next = segments[i + 1];
+		if (isWs && next && !isWhitespaceChar(next.segment)) {
+			wrapOppIndex = next.index;
+			wrapOppWidth = currentWidth;
 		}
 	}
 
-	// Push final chunk
-	if (currentChunk) {
-		chunks.push({
-			text: currentChunk,
-			startIndex: chunkStartIndex,
-			endIndex: line.length,
-		});
-	}
+	// Push final chunk.
+	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
 
-	return chunks.length > 0 ? chunks : [{ text: "", startIndex: 0, endIndex: 0 }];
+	return chunks;
 }
 
 // Kitty CSI-u sequences for printable keys, including optional shifted/base codepoints.
@@ -244,6 +146,7 @@ export interface EditorTheme {
 
 export interface EditorOptions {
 	paddingX?: number;
+	autocompleteMaxVisible?: number;
 }
 
 export class Editor implements Component, Focusable {
@@ -272,8 +175,9 @@ export class Editor implements Component, Focusable {
 	// Autocomplete support
 	private autocompleteProvider?: AutocompleteProvider;
 	private autocompleteList?: SelectList;
-	private isAutocompleting: boolean = false;
+	private autocompleteState: "regular" | "force" | null = null;
 	private autocompletePrefix: string = "";
+	private autocompleteMaxVisible: number = 5;
 
 	// Paste tracking for large pastes
 	private pastes: Map<number, string> = new Map();
@@ -282,7 +186,6 @@ export class Editor implements Component, Focusable {
 	// Bracketed paste mode buffering
 	private pasteBuffer: string = "";
 	private isInPaste: boolean = false;
-	private pendingShiftEnter: boolean = false;
 
 	// Prompt history for up/down navigation
 	private history: string[] = [];
@@ -292,6 +195,12 @@ export class Editor implements Component, Focusable {
 	// Also tracks undo coalescing: "type-word" means we're mid-word (coalescing)
 	private killRing: string[] = [];
 	private lastAction: "kill" | "yank" | "type-word" | null = null;
+
+	// Character jump mode
+	private jumpMode: "forward" | "backward" | null = null;
+
+	// Preferred visual column for vertical cursor movement (sticky column)
+	private preferredVisualCol: number | null = null;
 
 	// Undo support
 	private undoStack: EditorState[] = [];
@@ -306,6 +215,8 @@ export class Editor implements Component, Focusable {
 		this.borderColor = theme.borderColor;
 		const paddingX = options.paddingX ?? 0;
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
+		const maxVisible = options.autocompleteMaxVisible ?? 5;
+		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
 	}
 
 	getPaddingX(): number {
@@ -316,6 +227,18 @@ export class Editor implements Component, Focusable {
 		const newPadding = Number.isFinite(padding) ? Math.max(0, Math.floor(padding)) : 0;
 		if (this.paddingX !== newPadding) {
 			this.paddingX = newPadding;
+			this.tui.requestRender();
+		}
+	}
+
+	getAutocompleteMaxVisible(): number {
+		return this.autocompleteMaxVisible;
+	}
+
+	setAutocompleteMaxVisible(maxVisible: number): void {
+		const newMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
+		if (this.autocompleteMaxVisible !== newMaxVisible) {
+			this.autocompleteMaxVisible = newMaxVisible;
 			this.tui.requestRender();
 		}
 	}
@@ -380,13 +303,10 @@ export class Editor implements Component, Focusable {
 
 	/** Internal setText that doesn't reset history state - used by navigateHistory */
 	private setTextInternal(text: string): void {
-		// Reset kill ring state - external text changes break accumulation/yank chains
-		this.lastAction = null;
-
 		const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 		this.state.lines = lines.length === 0 ? [""] : lines;
 		this.state.cursorLine = this.state.lines.length - 1;
-		this.state.cursorCol = this.state.lines[this.state.cursorLine]?.length || 0;
+		this.setCursorCol(this.state.lines[this.state.cursorLine]?.length || 0);
 		// Reset scroll - render() will adjust to show cursor
 		this.scrollOffset = 0;
 
@@ -404,13 +324,17 @@ export class Editor implements Component, Focusable {
 		const paddingX = Math.min(this.paddingX, maxPadding);
 		const contentWidth = Math.max(1, width - paddingX * 2);
 
-		// Store width for cursor navigation
-		this.lastWidth = contentWidth;
+		// Layout width: with padding the cursor can overflow into it,
+		// without padding we reserve 1 column for the cursor.
+		const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
+
+		// Store for cursor navigation (must match wrapping width)
+		this.lastWidth = layoutWidth;
 
 		const horizontal = this.borderColor("─");
 
-		// Layout the text - use content width
-		const layoutLines = this.layoutText(contentWidth);
+		// Layout the text
+		const layoutLines = this.layoutText(layoutWidth);
 
 		// Calculate max visible lines: 30% of terminal height, minimum 5 lines
 		const terminalRows = this.tui.terminal.rows;
@@ -449,11 +373,12 @@ export class Editor implements Component, Focusable {
 
 		// Render each visible layout line
 		// Emit hardware cursor marker only when focused and not showing autocomplete
-		const emitCursorMarker = this.focused && !this.isAutocompleting;
+		const emitCursorMarker = this.focused && !this.autocompleteState;
 
 		for (const layoutLine of visibleLines) {
 			let displayText = layoutLine.text;
 			let lineVisibleWidth = visibleWidth(layoutLine.text);
+			let cursorInPadding = false;
 
 			// Add cursor if this line has it
 			if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
@@ -473,37 +398,23 @@ export class Editor implements Component, Focusable {
 					displayText = before + marker + cursor + restAfter;
 					// lineVisibleWidth stays the same - we're replacing, not adding
 				} else {
-					// Cursor is at the end - check if we have room for the space
-					if (lineVisibleWidth < contentWidth) {
-						// We have room - add highlighted space
-						const cursor = "\x1b[7m \x1b[0m";
-						displayText = before + marker + cursor;
-						// lineVisibleWidth increases by 1 - we're adding a space
-						lineVisibleWidth = lineVisibleWidth + 1;
-					} else {
-						// Line is at full width - use reverse video on last grapheme if possible
-						// or just show cursor at the end without adding space
-						const beforeGraphemes = [...segmenter.segment(before)];
-						if (beforeGraphemes.length > 0) {
-							const lastGrapheme = beforeGraphemes[beforeGraphemes.length - 1]?.segment || "";
-							const cursor = `\x1b[7m${lastGrapheme}\x1b[0m`;
-							// Rebuild 'before' without the last grapheme
-							const beforeWithoutLast = beforeGraphemes
-								.slice(0, -1)
-								.map((g) => g.segment)
-								.join("");
-							displayText = beforeWithoutLast + marker + cursor;
-						}
-						// lineVisibleWidth stays the same
+					// Cursor is at the end - add highlighted space
+					const cursor = "\x1b[7m \x1b[0m";
+					displayText = before + marker + cursor;
+					lineVisibleWidth = lineVisibleWidth + 1;
+					// If cursor overflows content width into the padding, flag it
+					if (lineVisibleWidth > contentWidth && paddingX > 0) {
+						cursorInPadding = true;
 					}
 				}
 			}
 
 			// Calculate padding based on actual visible width
 			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
+			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
 
 			// Render the line (no side borders, just horizontal lines above and below)
-			result.push(`${leftPadding}${displayText}${padding}${rightPadding}`);
+			result.push(`${leftPadding}${displayText}${padding}${lineRightPadding}`);
 		}
 
 		// Render bottom border (with scroll indicator if more content below)
@@ -517,7 +428,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Add autocomplete list if active
-		if (this.isAutocompleting && this.autocompleteList) {
+		if (this.autocompleteState && this.autocompleteList) {
 			const autocompleteResult = this.autocompleteList.render(contentWidth);
 			for (const line of autocompleteResult) {
 				const lineWidth = visibleWidth(line);
@@ -531,6 +442,26 @@ export class Editor implements Component, Focusable {
 
 	handleInput(data: string): void {
 		const kb = getEditorKeybindings();
+
+		// Handle character jump mode (awaiting next character to jump to)
+		if (this.jumpMode !== null) {
+			// Cancel if the hotkey is pressed again
+			if (kb.matches(data, "jumpForward") || kb.matches(data, "jumpBackward")) {
+				this.jumpMode = null;
+				return;
+			}
+
+			if (data.charCodeAt(0) >= 32) {
+				// Printable character - perform the jump
+				const direction = this.jumpMode;
+				this.jumpMode = null;
+				this.jumpToChar(data, direction);
+				return;
+			}
+
+			// Control character - cancel and fall through to normal handling
+			this.jumpMode = null;
+		}
 
 		// Handle bracketed paste mode
 		if (data.includes("\x1b[200~")) {
@@ -558,21 +489,6 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
-		if (this.pendingShiftEnter) {
-			if (data === "\r") {
-				this.pendingShiftEnter = false;
-				this.addNewLine();
-				return;
-			}
-			this.pendingShiftEnter = false;
-			this.insertCharacter("\\");
-		}
-
-		if (data === "\\") {
-			this.pendingShiftEnter = true;
-			return;
-		}
-
 		// Ctrl+C - let parent handle (exit/clear)
 		if (kb.matches(data, "copy")) {
 			return;
@@ -585,7 +501,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Handle autocomplete mode
-		if (this.isAutocompleting && this.autocompleteList) {
+		if (this.autocompleteState && this.autocompleteList) {
 			if (kb.matches(data, "selectCancel")) {
 				this.cancelAutocomplete();
 				return;
@@ -610,7 +526,7 @@ export class Editor implements Component, Focusable {
 					);
 					this.state.lines = result.lines;
 					this.state.cursorLine = result.cursorLine;
-					this.state.cursorCol = result.cursorCol;
+					this.setCursorCol(result.cursorCol);
 					this.cancelAutocomplete();
 					if (this.onChange) this.onChange(this.getText());
 				}
@@ -631,7 +547,7 @@ export class Editor implements Component, Focusable {
 					);
 					this.state.lines = result.lines;
 					this.state.cursorLine = result.cursorLine;
-					this.state.cursorCol = result.cursorCol;
+					this.setCursorCol(result.cursorCol);
 
 					if (this.autocompletePrefix.startsWith("/")) {
 						this.cancelAutocomplete();
@@ -646,7 +562,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Tab - trigger completion
-		if (kb.matches(data, "tab") && !this.isAutocompleting) {
+		if (kb.matches(data, "tab") && !this.autocompleteState) {
 			this.handleTabCompletion();
 			return;
 		}
@@ -712,8 +628,7 @@ export class Editor implements Component, Focusable {
 			data === "\x1b\r" ||
 			data === "\x1b[13;2~" ||
 			(data.length > 1 && data.includes("\x1b") && data.includes("\r")) ||
-			(data === "\n" && data.length === 1) ||
-			data === "\\\r"
+			(data === "\n" && data.length === 1)
 		) {
 			this.addNewLine();
 			return;
@@ -722,6 +637,15 @@ export class Editor implements Component, Focusable {
 		// Submit (Enter)
 		if (kb.matches(data, "submit")) {
 			if (this.disableSubmit) return;
+
+			// Workaround for terminals without Shift+Enter support:
+			// If char before cursor is \, delete it and insert newline instead of submitting.
+			const currentLine = this.state.lines[this.state.cursorLine] || "";
+			if (this.state.cursorCol > 0 && currentLine[this.state.cursorCol - 1] === "\\") {
+				this.handleBackspace();
+				this.addNewLine();
+				return;
+			}
 
 			let result = this.state.lines.join("\n").trim();
 			for (const [pasteId, pasteContent] of this.pastes) {
@@ -748,6 +672,9 @@ export class Editor implements Component, Focusable {
 				this.navigateHistory(-1);
 			} else if (this.historyIndex > -1 && this.isOnFirstVisualLine()) {
 				this.navigateHistory(-1);
+			} else if (this.isOnFirstVisualLine()) {
+				// Already at top - jump to start of line
+				this.moveToLineStart();
 			} else {
 				this.moveCursor(-1, 0);
 			}
@@ -756,6 +683,9 @@ export class Editor implements Component, Focusable {
 		if (kb.matches(data, "cursorDown")) {
 			if (this.historyIndex > -1 && this.isOnLastVisualLine()) {
 				this.navigateHistory(1);
+			} else if (this.isOnLastVisualLine()) {
+				// Already at bottom - jump to end of line
+				this.moveToLineEnd();
 			} else {
 				this.moveCursor(1, 0);
 			}
@@ -777,6 +707,16 @@ export class Editor implements Component, Focusable {
 		}
 		if (kb.matches(data, "pageDown")) {
 			this.pageScroll(1);
+			return;
+		}
+
+		// Character jump mode triggers
+		if (kb.matches(data, "jumpForward")) {
+			this.jumpMode = "forward";
+			return;
+		}
+		if (kb.matches(data, "jumpBackward")) {
+			this.jumpMode = "backward";
 			return;
 		}
 
@@ -912,13 +852,13 @@ export class Editor implements Component, Focusable {
 	}
 
 	setText(text: string): void {
+		this.lastAction = null;
 		this.historyIndex = -1; // Exit history browsing mode
 		// Push undo snapshot if content differs (makes programmatic changes undoable)
 		if (this.getText() !== text) {
 			this.pushUndoSnapshot();
 		}
 		this.setTextInternal(text);
-		this.lastAction = null;
 	}
 
 	/**
@@ -930,8 +870,55 @@ export class Editor implements Component, Focusable {
 		if (!text) return;
 		this.pushUndoSnapshot();
 		this.lastAction = null;
-		for (const char of text) {
-			this.insertCharacter(char, true);
+		this.historyIndex = -1;
+		this.insertTextAtCursorInternal(text);
+	}
+
+	/**
+	 * Internal text insertion at cursor. Handles single and multi-line text.
+	 * Does not push undo snapshots or trigger autocomplete - caller is responsible.
+	 * Normalizes line endings and calls onChange once at the end.
+	 */
+	private insertTextAtCursorInternal(text: string): void {
+		if (!text) return;
+
+		// Normalize line endings
+		const normalized = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+		const insertedLines = normalized.split("\n");
+
+		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
+		const afterCursor = currentLine.slice(this.state.cursorCol);
+
+		if (insertedLines.length === 1) {
+			// Single line - insert at cursor position
+			this.state.lines[this.state.cursorLine] = beforeCursor + normalized + afterCursor;
+			this.setCursorCol(this.state.cursorCol + normalized.length);
+		} else {
+			// Multi-line insertion
+			this.state.lines = [
+				// All lines before current line
+				...this.state.lines.slice(0, this.state.cursorLine),
+
+				// The first inserted line merged with text before cursor
+				beforeCursor + insertedLines[0],
+
+				// All middle inserted lines
+				...insertedLines.slice(1, -1),
+
+				// The last inserted line with text after cursor
+				insertedLines[insertedLines.length - 1] + afterCursor,
+
+				// All lines after current line
+				...this.state.lines.slice(this.state.cursorLine + 1),
+			];
+
+			this.state.cursorLine += insertedLines.length - 1;
+			this.setCursorCol((insertedLines[insertedLines.length - 1] || "").length);
+		}
+
+		if (this.onChange) {
+			this.onChange(this.getText());
 		}
 	}
 
@@ -943,7 +930,7 @@ export class Editor implements Component, Focusable {
 		// - Consecutive word chars coalesce into one undo unit
 		// - Space captures state before itself (so undo removes space+following word together)
 		// - Each space is separately undoable
-		// Skip coalescing when called from atomic operations (paste, insertTextAtCursor)
+		// Skip coalescing when called from atomic operations (e.g., handlePaste)
 		if (!skipUndoCoalescing) {
 			if (isWhitespaceChar(char) || this.lastAction !== "type-word") {
 				this.pushUndoSnapshot();
@@ -957,14 +944,14 @@ export class Editor implements Component, Focusable {
 		const after = line.slice(this.state.cursorCol);
 
 		this.state.lines[this.state.cursorLine] = before + char + after;
-		this.state.cursorCol += char.length; // Fix: increment by the length of the inserted string
+		this.setCursorCol(this.state.cursorCol + char.length);
 
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
 
 		// Check if we should trigger or update autocomplete
-		if (!this.isAutocompleting) {
+		if (!this.autocompleteState) {
 			// Auto-trigger for "/" at the start of a line (slash commands)
 			if (char === "/" && this.isAtStartOfMessage()) {
 				this.tryTriggerAutocomplete();
@@ -984,7 +971,7 @@ export class Editor implements Component, Focusable {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
 				// Check if we're in a slash command (with or without space for arguments)
-				if (textBeforeCursor.trimStart().startsWith("/")) {
+				if (this.isInSlashCommandContext(textBeforeCursor)) {
 					this.tryTriggerAutocomplete();
 				}
 				// Check if we're in an @ file reference context
@@ -1025,7 +1012,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
-		// Split into lines
+		// Split into lines to check for large paste
 		const pastedLines = filteredText.split("\n");
 
 		// Check if this is a large paste (> 10 lines or > 1000 characters)
@@ -1041,61 +1028,20 @@ export class Editor implements Component, Focusable {
 				pastedLines.length > 10
 					? `[paste #${pasteId} +${pastedLines.length} lines]`
 					: `[paste #${pasteId} ${totalChars} chars]`;
-			for (const char of marker) {
-				this.insertCharacter(char, true);
-			}
+			this.insertTextAtCursorInternal(marker);
 			return;
 		}
 
 		if (pastedLines.length === 1) {
-			// Single line - just insert each character
-			const text = pastedLines[0] || "";
-			for (const char of text) {
+			// Single line - insert character by character to trigger autocomplete
+			for (const char of filteredText) {
 				this.insertCharacter(char, true);
 			}
 			return;
 		}
 
-		// Multi-line paste - be very careful with array manipulation
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-		const afterCursor = currentLine.slice(this.state.cursorCol);
-
-		// Build the new lines array step by step
-		const newLines: string[] = [];
-
-		// Add all lines before current line
-		for (let i = 0; i < this.state.cursorLine; i++) {
-			newLines.push(this.state.lines[i] || "");
-		}
-
-		// Add the first pasted line merged with before cursor text
-		newLines.push(beforeCursor + (pastedLines[0] || ""));
-
-		// Add all middle pasted lines
-		for (let i = 1; i < pastedLines.length - 1; i++) {
-			newLines.push(pastedLines[i] || "");
-		}
-
-		// Add the last pasted line with after cursor text
-		newLines.push((pastedLines[pastedLines.length - 1] || "") + afterCursor);
-
-		// Add all lines after current line
-		for (let i = this.state.cursorLine + 1; i < this.state.lines.length; i++) {
-			newLines.push(this.state.lines[i] || "");
-		}
-
-		// Replace the entire lines array
-		this.state.lines = newLines;
-
-		// Update cursor position to end of pasted content
-		this.state.cursorLine += pastedLines.length - 1;
-		this.state.cursorCol = (pastedLines[pastedLines.length - 1] || "").length;
-
-		// Notify of change
-		if (this.onChange) {
-			this.onChange(this.getText());
-		}
+		// Multi-line paste - use direct state manipulation
+		this.insertTextAtCursorInternal(filteredText);
 	}
 
 	private addNewLine(): void {
@@ -1115,7 +1061,7 @@ export class Editor implements Component, Focusable {
 
 		// Move cursor to start of new line
 		this.state.cursorLine++;
-		this.state.cursorCol = 0;
+		this.setCursorCol(0);
 
 		if (this.onChange) {
 			this.onChange(this.getText());
@@ -1142,7 +1088,7 @@ export class Editor implements Component, Focusable {
 			const after = line.slice(this.state.cursorCol);
 
 			this.state.lines[this.state.cursorLine] = before + after;
-			this.state.cursorCol -= graphemeLength;
+			this.setCursorCol(this.state.cursorCol - graphemeLength);
 		} else if (this.state.cursorLine > 0) {
 			this.pushUndoSnapshot();
 
@@ -1154,7 +1100,7 @@ export class Editor implements Component, Focusable {
 			this.state.lines.splice(this.state.cursorLine, 1);
 
 			this.state.cursorLine--;
-			this.state.cursorCol = previousLine.length;
+			this.setCursorCol(previousLine.length);
 		}
 
 		if (this.onChange) {
@@ -1162,14 +1108,14 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Update or re-trigger autocomplete after backspace
-		if (this.isAutocompleting) {
+		if (this.autocompleteState) {
 			this.updateAutocomplete();
 		} else {
 			// If autocomplete was cancelled (no matches), re-trigger if we're in a completable context
 			const currentLine = this.state.lines[this.state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
 			// Slash command context
-			if (textBeforeCursor.trimStart().startsWith("/")) {
+			if (this.isInSlashCommandContext(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
 			// @ file reference context
@@ -1179,15 +1125,117 @@ export class Editor implements Component, Focusable {
 		}
 	}
 
+	/**
+	 * Set cursor column and clear preferredVisualCol.
+	 * Use this for all non-vertical cursor movements to reset sticky column behavior.
+	 */
+	private setCursorCol(col: number): void {
+		this.state.cursorCol = col;
+		this.preferredVisualCol = null;
+	}
+
+	/**
+	 * Move cursor to a target visual line, applying sticky column logic.
+	 * Shared by moveCursor() and pageScroll().
+	 */
+	private moveToVisualLine(
+		visualLines: Array<{ logicalLine: number; startCol: number; length: number }>,
+		currentVisualLine: number,
+		targetVisualLine: number,
+	): void {
+		const currentVL = visualLines[currentVisualLine];
+		const targetVL = visualLines[targetVisualLine];
+
+		if (currentVL && targetVL) {
+			const currentVisualCol = this.state.cursorCol - currentVL.startCol;
+
+			// For non-last segments, clamp to length-1 to stay within the segment
+			const isLastSourceSegment =
+				currentVisualLine === visualLines.length - 1 ||
+				visualLines[currentVisualLine + 1]?.logicalLine !== currentVL.logicalLine;
+			const sourceMaxVisualCol = isLastSourceSegment ? currentVL.length : Math.max(0, currentVL.length - 1);
+
+			const isLastTargetSegment =
+				targetVisualLine === visualLines.length - 1 ||
+				visualLines[targetVisualLine + 1]?.logicalLine !== targetVL.logicalLine;
+			const targetMaxVisualCol = isLastTargetSegment ? targetVL.length : Math.max(0, targetVL.length - 1);
+
+			const moveToVisualCol = this.computeVerticalMoveColumn(
+				currentVisualCol,
+				sourceMaxVisualCol,
+				targetMaxVisualCol,
+			);
+
+			// Set cursor position
+			this.state.cursorLine = targetVL.logicalLine;
+			const targetCol = targetVL.startCol + moveToVisualCol;
+			const logicalLine = this.state.lines[targetVL.logicalLine] || "";
+			this.state.cursorCol = Math.min(targetCol, logicalLine.length);
+		}
+	}
+
+	/**
+	 * Compute the target visual column for vertical cursor movement.
+	 * Implements the sticky column decision table:
+	 *
+	 * | P | S | T | U | Scenario                                             | Set Preferred | Move To     |
+	 * |---|---|---|---| ---------------------------------------------------- |---------------|-------------|
+	 * | 0 | * | 0 | - | Start nav, target fits                               | null          | current     |
+	 * | 0 | * | 1 | - | Start nav, target shorter                            | current       | target end  |
+	 * | 1 | 0 | 0 | 0 | Clamped, target fits preferred                       | null          | preferred   |
+	 * | 1 | 0 | 0 | 1 | Clamped, target longer but still can't fit preferred | keep          | target end  |
+	 * | 1 | 0 | 1 | - | Clamped, target even shorter                         | keep          | target end  |
+	 * | 1 | 1 | 0 | - | Rewrapped, target fits current                       | null          | current     |
+	 * | 1 | 1 | 1 | - | Rewrapped, target shorter than current               | current       | target end  |
+	 *
+	 * Where:
+	 * - P = preferred col is set
+	 * - S = cursor in middle of source line (not clamped to end)
+	 * - T = target line shorter than current visual col
+	 * - U = target line shorter than preferred col
+	 */
+	private computeVerticalMoveColumn(
+		currentVisualCol: number,
+		sourceMaxVisualCol: number,
+		targetMaxVisualCol: number,
+	): number {
+		const hasPreferred = this.preferredVisualCol !== null; // P
+		const cursorInMiddle = currentVisualCol < sourceMaxVisualCol; // S
+		const targetTooShort = targetMaxVisualCol < currentVisualCol; // T
+
+		if (!hasPreferred || cursorInMiddle) {
+			if (targetTooShort) {
+				// Cases 2 and 7
+				this.preferredVisualCol = currentVisualCol;
+				return targetMaxVisualCol;
+			}
+
+			// Cases 1 and 6
+			this.preferredVisualCol = null;
+			return currentVisualCol;
+		}
+
+		const targetCantFitPreferred = targetMaxVisualCol < this.preferredVisualCol!; // U
+		if (targetTooShort || targetCantFitPreferred) {
+			// Cases 4 and 5
+			return targetMaxVisualCol;
+		}
+
+		// Case 3
+		const result = this.preferredVisualCol!;
+		this.preferredVisualCol = null;
+		return result;
+	}
+
 	private moveToLineStart(): void {
 		this.lastAction = null;
-		this.state.cursorCol = 0;
+		this.setCursorCol(0);
 	}
 
 	private moveToLineEnd(): void {
 		this.lastAction = null;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		this.state.cursorCol = currentLine.length;
+		this.setCursorCol(currentLine.length);
 	}
 
 	private deleteToStartOfLine(): void {
@@ -1205,7 +1253,7 @@ export class Editor implements Component, Focusable {
 
 			// Delete from start of line up to cursor
 			this.state.lines[this.state.cursorLine] = currentLine.slice(this.state.cursorCol);
-			this.state.cursorCol = 0;
+			this.setCursorCol(0);
 		} else if (this.state.cursorLine > 0) {
 			this.pushUndoSnapshot();
 
@@ -1217,7 +1265,7 @@ export class Editor implements Component, Focusable {
 			this.state.lines[this.state.cursorLine - 1] = previousLine + currentLine;
 			this.state.lines.splice(this.state.cursorLine, 1);
 			this.state.cursorLine--;
-			this.state.cursorCol = previousLine.length;
+			this.setCursorCol(previousLine.length);
 		}
 
 		if (this.onChange) {
@@ -1275,7 +1323,7 @@ export class Editor implements Component, Focusable {
 				this.state.lines[this.state.cursorLine - 1] = previousLine + currentLine;
 				this.state.lines.splice(this.state.cursorLine, 1);
 				this.state.cursorLine--;
-				this.state.cursorCol = previousLine.length;
+				this.setCursorCol(previousLine.length);
 			}
 		} else {
 			this.pushUndoSnapshot();
@@ -1286,7 +1334,7 @@ export class Editor implements Component, Focusable {
 			const oldCursorCol = this.state.cursorCol;
 			this.moveWordBackwards();
 			const deleteFrom = this.state.cursorCol;
-			this.state.cursorCol = oldCursorCol;
+			this.setCursorCol(oldCursorCol);
 
 			// Restore kill state for accumulation check, then save to kill ring
 			this.lastAction = wasKill ? "kill" : null;
@@ -1296,7 +1344,7 @@ export class Editor implements Component, Focusable {
 
 			this.state.lines[this.state.cursorLine] =
 				currentLine.slice(0, deleteFrom) + currentLine.slice(this.state.cursorCol);
-			this.state.cursorCol = deleteFrom;
+			this.setCursorCol(deleteFrom);
 		}
 
 		if (this.onChange) {
@@ -1331,7 +1379,7 @@ export class Editor implements Component, Focusable {
 			const oldCursorCol = this.state.cursorCol;
 			this.moveWordForwards();
 			const deleteTo = this.state.cursorCol;
-			this.state.cursorCol = oldCursorCol;
+			this.setCursorCol(oldCursorCol);
 
 			// Restore kill state for accumulation check, then save to kill ring
 			this.lastAction = wasKill ? "kill" : null;
@@ -1382,13 +1430,13 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Update or re-trigger autocomplete after forward delete
-		if (this.isAutocompleting) {
+		if (this.autocompleteState) {
 			this.updateAutocomplete();
 		} else {
 			const currentLine = this.state.lines[this.state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
 			// Slash command context
-			if (textBeforeCursor.trimStart().startsWith("/")) {
+			if (this.isInSlashCommandContext(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
 			// @ file reference context
@@ -1458,29 +1506,14 @@ export class Editor implements Component, Focusable {
 
 	private moveCursor(deltaLine: number, deltaCol: number): void {
 		this.lastAction = null;
-		const width = this.lastWidth;
+		const visualLines = this.buildVisualLineMap(this.lastWidth);
+		const currentVisualLine = this.findCurrentVisualLine(visualLines);
 
 		if (deltaLine !== 0) {
-			// Build visual line map for navigation
-			const visualLines = this.buildVisualLineMap(width);
-			const currentVisualLine = this.findCurrentVisualLine(visualLines);
-
-			// Calculate column position within current visual line
-			const currentVL = visualLines[currentVisualLine];
-			const visualCol = currentVL ? this.state.cursorCol - currentVL.startCol : 0;
-
-			// Move to target visual line
 			const targetVisualLine = currentVisualLine + deltaLine;
 
 			if (targetVisualLine >= 0 && targetVisualLine < visualLines.length) {
-				const targetVL = visualLines[targetVisualLine];
-				if (targetVL) {
-					this.state.cursorLine = targetVL.logicalLine;
-					// Try to maintain visual column position, clamped to line length
-					const targetCol = targetVL.startCol + Math.min(visualCol, targetVL.length);
-					const logicalLine = this.state.lines[targetVL.logicalLine] || "";
-					this.state.cursorCol = Math.min(targetCol, logicalLine.length);
-				}
+				this.moveToVisualLine(visualLines, currentVisualLine, targetVisualLine);
 			}
 		}
 
@@ -1493,11 +1526,17 @@ export class Editor implements Component, Focusable {
 					const afterCursor = currentLine.slice(this.state.cursorCol);
 					const graphemes = [...segmenter.segment(afterCursor)];
 					const firstGrapheme = graphemes[0];
-					this.state.cursorCol += firstGrapheme ? firstGrapheme.segment.length : 1;
+					this.setCursorCol(this.state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine < this.state.lines.length - 1) {
 					// Wrap to start of next logical line
 					this.state.cursorLine++;
-					this.state.cursorCol = 0;
+					this.setCursorCol(0);
+				} else {
+					// At end of last line - can't move, but set preferredVisualCol for up/down navigation
+					const currentVL = visualLines[currentVisualLine];
+					if (currentVL) {
+						this.preferredVisualCol = this.state.cursorCol - currentVL.startCol;
+					}
 				}
 			} else {
 				// Moving left - move by one grapheme (handles emojis, combining characters, etc.)
@@ -1505,12 +1544,12 @@ export class Editor implements Component, Focusable {
 					const beforeCursor = currentLine.slice(0, this.state.cursorCol);
 					const graphemes = [...segmenter.segment(beforeCursor)];
 					const lastGrapheme = graphemes[graphemes.length - 1];
-					this.state.cursorCol -= lastGrapheme ? lastGrapheme.segment.length : 1;
+					this.setCursorCol(this.state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine > 0) {
 					// Wrap to end of previous logical line
 					this.state.cursorLine--;
 					const prevLine = this.state.lines[this.state.cursorLine] || "";
-					this.state.cursorCol = prevLine.length;
+					this.setCursorCol(prevLine.length);
 				}
 			}
 		}
@@ -1522,29 +1561,14 @@ export class Editor implements Component, Focusable {
 	 */
 	private pageScroll(direction: -1 | 1): void {
 		this.lastAction = null;
-		const width = this.lastWidth;
 		const terminalRows = this.tui.terminal.rows;
 		const pageSize = Math.max(5, Math.floor(terminalRows * 0.3));
 
-		// Build visual line map
-		const visualLines = this.buildVisualLineMap(width);
+		const visualLines = this.buildVisualLineMap(this.lastWidth);
 		const currentVisualLine = this.findCurrentVisualLine(visualLines);
-
-		// Calculate target visual line
 		const targetVisualLine = Math.max(0, Math.min(visualLines.length - 1, currentVisualLine + direction * pageSize));
 
-		// Move cursor to target visual line
-		const targetVL = visualLines[targetVisualLine];
-		if (targetVL) {
-			// Preserve column position within the line
-			const currentVL = visualLines[currentVisualLine];
-			const visualCol = currentVL ? this.state.cursorCol - currentVL.startCol : 0;
-
-			this.state.cursorLine = targetVL.logicalLine;
-			const targetCol = targetVL.startCol + Math.min(visualCol, targetVL.length);
-			const logicalLine = this.state.lines[targetVL.logicalLine] || "";
-			this.state.cursorCol = Math.min(targetCol, logicalLine.length);
-		}
+		this.moveToVisualLine(visualLines, currentVisualLine, targetVisualLine);
 	}
 
 	private moveWordBackwards(): void {
@@ -1556,7 +1580,7 @@ export class Editor implements Component, Focusable {
 			if (this.state.cursorLine > 0) {
 				this.state.cursorLine--;
 				const prevLine = this.state.lines[this.state.cursorLine] || "";
-				this.state.cursorCol = prevLine.length;
+				this.setCursorCol(prevLine.length);
 			}
 			return;
 		}
@@ -1589,7 +1613,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
-		this.state.cursorCol = newCol;
+		this.setCursorCol(newCol);
 	}
 
 	/**
@@ -1643,7 +1667,7 @@ export class Editor implements Component, Focusable {
 			const before = currentLine.slice(0, this.state.cursorCol);
 			const after = currentLine.slice(this.state.cursorCol);
 			this.state.lines[this.state.cursorLine] = before + text + after;
-			this.state.cursorCol += text.length;
+			this.setCursorCol(this.state.cursorCol + text.length);
 		} else {
 			// Multi-line insert
 			const currentLine = this.state.lines[this.state.cursorLine] || "";
@@ -1664,7 +1688,7 @@ export class Editor implements Component, Focusable {
 
 			// Update cursor position
 			this.state.cursorLine = lastLineIndex;
-			this.state.cursorCol = (lines[lines.length - 1] || "").length;
+			this.setCursorCol((lines[lines.length - 1] || "").length);
 		}
 
 		if (this.onChange) {
@@ -1689,7 +1713,7 @@ export class Editor implements Component, Focusable {
 			const before = currentLine.slice(0, this.state.cursorCol - deleteLen);
 			const after = currentLine.slice(this.state.cursorCol);
 			this.state.lines[this.state.cursorLine] = before + after;
-			this.state.cursorCol -= deleteLen;
+			this.setCursorCol(this.state.cursorCol - deleteLen);
 		} else {
 			// Multi-line delete - cursor is at end of last yanked line
 			const startLine = this.state.cursorLine - (yankLines.length - 1);
@@ -1706,7 +1730,7 @@ export class Editor implements Component, Focusable {
 
 			// Update cursor
 			this.state.cursorLine = startLine;
-			this.state.cursorCol = startCol;
+			this.setCursorCol(startCol);
 		}
 
 		if (this.onChange) {
@@ -1755,9 +1779,44 @@ export class Editor implements Component, Focusable {
 		const snapshot = this.undoStack.pop()!;
 		this.restoreUndoSnapshot(snapshot);
 		this.lastAction = null;
+		this.preferredVisualCol = null;
 		if (this.onChange) {
 			this.onChange(this.getText());
 		}
+	}
+
+	/**
+	 * Jump to the first occurrence of a character in the specified direction.
+	 * Multi-line search. Case-sensitive. Skips the current cursor position.
+	 */
+	private jumpToChar(char: string, direction: "forward" | "backward"): void {
+		this.lastAction = null;
+		const isForward = direction === "forward";
+		const lines = this.state.lines;
+
+		const end = isForward ? lines.length : -1;
+		const step = isForward ? 1 : -1;
+
+		for (let lineIdx = this.state.cursorLine; lineIdx !== end; lineIdx += step) {
+			const line = lines[lineIdx] || "";
+			const isCurrentLine = lineIdx === this.state.cursorLine;
+
+			// Current line: start after/before cursor; other lines: search full line
+			const searchFrom = isCurrentLine
+				? isForward
+					? this.state.cursorCol + 1
+					: this.state.cursorCol - 1
+				: undefined;
+
+			const idx = isForward ? line.indexOf(char, searchFrom) : line.lastIndexOf(char, searchFrom);
+
+			if (idx !== -1) {
+				this.state.cursorLine = lineIdx;
+				this.setCursorCol(idx);
+				return;
+			}
+		}
+		// No match found - cursor stays in place
 	}
 
 	private moveWordForwards(): void {
@@ -1768,7 +1827,7 @@ export class Editor implements Component, Focusable {
 		if (this.state.cursorCol >= currentLine.length) {
 			if (this.state.cursorLine < this.state.lines.length - 1) {
 				this.state.cursorLine++;
-				this.state.cursorCol = 0;
+				this.setCursorCol(0);
 			}
 			return;
 		}
@@ -1777,10 +1836,11 @@ export class Editor implements Component, Focusable {
 		const segments = segmenter.segment(textAfterCursor);
 		const iterator = segments[Symbol.iterator]();
 		let next = iterator.next();
+		let newCol = this.state.cursorCol;
 
 		// Skip leading whitespace
 		while (!next.done && isWhitespaceChar(next.value.segment)) {
-			this.state.cursorCol += next.value.segment.length;
+			newCol += next.value.segment.length;
 			next = iterator.next();
 		}
 
@@ -1789,26 +1849,40 @@ export class Editor implements Component, Focusable {
 			if (isPunctuationChar(firstGrapheme)) {
 				// Skip punctuation run
 				while (!next.done && isPunctuationChar(next.value.segment)) {
-					this.state.cursorCol += next.value.segment.length;
+					newCol += next.value.segment.length;
 					next = iterator.next();
 				}
 			} else {
 				// Skip word run
 				while (!next.done && !isWhitespaceChar(next.value.segment) && !isPunctuationChar(next.value.segment)) {
-					this.state.cursorCol += next.value.segment.length;
+					newCol += next.value.segment.length;
 					next = iterator.next();
 				}
 			}
 		}
+
+		this.setCursorCol(newCol);
+	}
+
+	// Slash menu only allowed when all other lines are empty (no mixed content)
+	private isSlashMenuAllowed(): boolean {
+		for (let i = 0; i < this.state.lines.length; i++) {
+			if (i === this.state.cursorLine) continue;
+			if (this.state.lines[i].trim() !== "") return false;
+		}
+		return true;
 	}
 
 	// Helper method to check if cursor is at start of message (for slash command detection)
 	private isAtStartOfMessage(): boolean {
+		if (!this.isSlashMenuAllowed()) return false;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-
-		// At start if line is empty, only contains whitespace, or is just "/"
 		return beforeCursor.trim() === "" || beforeCursor.trim() === "/";
+	}
+
+	private isInSlashCommandContext(textBeforeCursor: string): boolean {
+		return this.isSlashMenuAllowed() && textBeforeCursor.trimStart().startsWith("/");
 	}
 
 	// Autocomplete methods
@@ -1834,8 +1908,8 @@ export class Editor implements Component, Focusable {
 
 		if (suggestions && suggestions.items.length > 0) {
 			this.autocompletePrefix = suggestions.prefix;
-			this.autocompleteList = new SelectList(suggestions.items, 5, this.theme.selectList);
-			this.isAutocompleting = true;
+			this.autocompleteList = new SelectList(suggestions.items, this.autocompleteMaxVisible, this.theme.selectList);
+			this.autocompleteState = "regular";
 		} else {
 			this.cancelAutocomplete();
 		}
@@ -1848,10 +1922,10 @@ export class Editor implements Component, Focusable {
 		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
 
 		// Check if we're in a slash command context
-		if (beforeCursor.trimStart().startsWith("/") && !beforeCursor.trimStart().includes(" ")) {
+		if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
 			this.handleSlashCommandCompletion();
 		} else {
-			this.forceFileAutocomplete();
+			this.forceFileAutocomplete(true);
 		}
 	}
 
@@ -1864,7 +1938,7 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 17 this job fails with https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19
 536643416/job/55932288317 havea  look at .gi
 	 */
-	private forceFileAutocomplete(): void {
+	private forceFileAutocomplete(explicitTab: boolean = false): void {
 		if (!this.autocompleteProvider) return;
 
 		// Check if provider supports force file suggestions via runtime check
@@ -1883,37 +1957,60 @@ https://github.com/EsotericSoftware/spine-runtimes/actions/runs/19536643416/job/
 		);
 
 		if (suggestions && suggestions.items.length > 0) {
+			// If there's exactly one suggestion, apply it immediately
+			if (explicitTab && suggestions.items.length === 1) {
+				const item = suggestions.items[0]!;
+				this.pushUndoSnapshot();
+				this.lastAction = null;
+				const result = this.autocompleteProvider.applyCompletion(
+					this.state.lines,
+					this.state.cursorLine,
+					this.state.cursorCol,
+					item,
+					suggestions.prefix,
+				);
+				this.state.lines = result.lines;
+				this.state.cursorLine = result.cursorLine;
+				this.setCursorCol(result.cursorCol);
+				if (this.onChange) this.onChange(this.getText());
+				return;
+			}
+
 			this.autocompletePrefix = suggestions.prefix;
-			this.autocompleteList = new SelectList(suggestions.items, 5, this.theme.selectList);
-			this.isAutocompleting = true;
+			this.autocompleteList = new SelectList(suggestions.items, this.autocompleteMaxVisible, this.theme.selectList);
+			this.autocompleteState = "force";
 		} else {
 			this.cancelAutocomplete();
 		}
 	}
 
 	private cancelAutocomplete(): void {
-		this.isAutocompleting = false;
+		this.autocompleteState = null;
 		this.autocompleteList = undefined;
 		this.autocompletePrefix = "";
 	}
 
 	public isShowingAutocomplete(): boolean {
-		return this.isAutocompleting;
+		return this.autocompleteState !== null;
 	}
 
 	private updateAutocomplete(): void {
-		if (!this.isAutocompleting || !this.autocompleteProvider) return;
+		if (!this.autocompleteState || !this.autocompleteProvider) return;
+
+		if (this.autocompleteState === "force") {
+			this.forceFileAutocomplete();
+			return;
+		}
 
 		const suggestions = this.autocompleteProvider.getSuggestions(
 			this.state.lines,
 			this.state.cursorLine,
 			this.state.cursorCol,
 		);
-
 		if (suggestions && suggestions.items.length > 0) {
 			this.autocompletePrefix = suggestions.prefix;
 			// Always create new SelectList to ensure update
-			this.autocompleteList = new SelectList(suggestions.items, 5, this.theme.selectList);
+			this.autocompleteList = new SelectList(suggestions.items, this.autocompleteMaxVisible, this.theme.selectList);
 		} else {
 			this.cancelAutocomplete();
 		}

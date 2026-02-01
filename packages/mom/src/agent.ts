@@ -458,6 +458,8 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		getAgentsFiles: () => ({ agentsFiles: [] }),
 		getSystemPrompt: () => systemPrompt,
 		getAppendSystemPrompt: () => [],
+		getPathMetadata: () => new Map(),
+		extendResources: () => {},
 		reload: async () => {},
 	};
 

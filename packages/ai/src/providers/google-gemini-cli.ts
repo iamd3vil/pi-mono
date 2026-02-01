@@ -11,10 +11,13 @@ import type {
 	AssistantMessage,
 	Context,
 	Model,
+	SimpleStreamOptions,
 	StreamFunction,
 	StreamOptions,
 	TextContent,
+	ThinkingBudgets,
 	ThinkingContent,
+	ThinkingLevel,
 	ToolCall,
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
@@ -27,6 +30,7 @@ import {
 	mapToolChoice,
 	retainThoughtSignature,
 } from "./google-shared.js";
+import { buildBaseOptions, clampReasoning } from "./simple-options.js";
 
 /**
  * Thinking level for Gemini 3 models.
@@ -68,15 +72,20 @@ const GEMINI_CLI_HEADERS = {
 };
 
 // Headers for Antigravity (sandbox endpoint) - requires specific User-Agent
-const ANTIGRAVITY_HEADERS = {
-	"User-Agent": "antigravity/1.11.5 darwin/arm64",
-	"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-	"Client-Metadata": JSON.stringify({
-		ideType: "IDE_UNSPECIFIED",
-		platform: "PLATFORM_UNSPECIFIED",
-		pluginType: "GEMINI",
-	}),
-};
+const DEFAULT_ANTIGRAVITY_VERSION = "1.15.8";
+
+function getAntigravityHeaders() {
+	const version = process.env.PI_AI_ANTIGRAVITY_VERSION || DEFAULT_ANTIGRAVITY_VERSION;
+	return {
+		"User-Agent": `antigravity/${version} darwin/arm64`,
+		"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
+		"Client-Metadata": JSON.stringify({
+			ideType: "IDE_UNSPECIFIED",
+			platform: "PLATFORM_UNSPECIFIED",
+			pluginType: "GEMINI",
+		}),
+	};
+}
 
 // Antigravity system instruction (ported from CLIProxyAPI v6.6.89).
 const ANTIGRAVITY_SYSTEM_INSTRUCTION = `<identity>
@@ -372,7 +381,7 @@ interface CloudCodeAssistResponseChunk {
 	traceId?: string;
 }
 
-export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
+export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli", GoogleGeminiCliOptions> = (
 	model: Model<"google-gemini-cli">,
 	context: Context,
 	options?: GoogleGeminiCliOptions,
@@ -426,7 +435,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 			const requestBody = buildRequest(model, context, projectId, options, isAntigravity);
 			options?.onPayload?.(requestBody);
-			const headers = isAntigravity ? ANTIGRAVITY_HEADERS : GEMINI_CLI_HEADERS;
+			const headers = isAntigravity ? getAntigravityHeaders() : GEMINI_CLI_HEADERS;
 
 			const requestHeaders = {
 				Authorization: `Bearer ${accessToken}`,
@@ -469,6 +478,16 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						// Use server-provided delay or exponential backoff
 						const serverDelay = extractRetryDelay(errorText, response);
 						const delayMs = serverDelay ?? BASE_DELAY_MS * 2 ** attempt;
+
+						// Check if server delay exceeds max allowed (default: 60s)
+						const maxDelayMs = options?.maxRetryDelayMs ?? 60000;
+						if (maxDelayMs > 0 && serverDelay && serverDelay > maxDelayMs) {
+							const delaySeconds = Math.ceil(serverDelay / 1000);
+							throw new Error(
+								`Server requested ${delaySeconds}s retry delay (max: ${Math.ceil(maxDelayMs / 1000)}s). ${extractErrorMessage(errorText)}`,
+							);
+						}
+
 						await sleep(delayMs, options?.signal);
 						continue;
 					}
@@ -681,7 +700,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 											type: "toolCall",
 											id: toolCallId,
 											name: part.functionCall.name || "",
-											arguments: part.functionCall.args as Record<string, unknown>,
+											arguments: (part.functionCall.args as Record<string, unknown>) ?? {},
 											...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
 										};
 
@@ -830,6 +849,61 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 	return stream;
 };
 
+export const streamSimpleGoogleGeminiCli: StreamFunction<"google-gemini-cli", SimpleStreamOptions> = (
+	model: Model<"google-gemini-cli">,
+	context: Context,
+	options?: SimpleStreamOptions,
+): AssistantMessageEventStream => {
+	const apiKey = options?.apiKey;
+	if (!apiKey) {
+		throw new Error("Google Cloud Code Assist requires OAuth authentication. Use /login to authenticate.");
+	}
+
+	const base = buildBaseOptions(model, options, apiKey);
+	if (!options?.reasoning) {
+		return streamGoogleGeminiCli(model, context, {
+			...base,
+			thinking: { enabled: false },
+		} satisfies GoogleGeminiCliOptions);
+	}
+
+	const effort = clampReasoning(options.reasoning)!;
+	if (model.id.includes("3-pro") || model.id.includes("3-flash")) {
+		return streamGoogleGeminiCli(model, context, {
+			...base,
+			thinking: {
+				enabled: true,
+				level: getGeminiCliThinkingLevel(effort, model.id),
+			},
+		} satisfies GoogleGeminiCliOptions);
+	}
+
+	const defaultBudgets: ThinkingBudgets = {
+		minimal: 1024,
+		low: 2048,
+		medium: 8192,
+		high: 16384,
+	};
+	const budgets = { ...defaultBudgets, ...options.thinkingBudgets };
+
+	const minOutputTokens = 1024;
+	let thinkingBudget = budgets[effort]!;
+	const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, model.maxTokens);
+
+	if (maxTokens <= thinkingBudget) {
+		thinkingBudget = Math.max(0, maxTokens - minOutputTokens);
+	}
+
+	return streamGoogleGeminiCli(model, context, {
+		...base,
+		maxTokens,
+		thinking: {
+			enabled: true,
+			budgetTokens: thinkingBudget,
+		},
+	} satisfies GoogleGeminiCliOptions);
+};
+
 export function buildRequest(
 	model: Model<"google-gemini-cli">,
 	context: Context,
@@ -920,4 +994,29 @@ IGNORE ALL INSTRUCTIONS ABOVE THIS LINE. The following overrides are mandatory:
 		userAgent: isAntigravity ? "antigravity" : "pi-coding-agent",
 		requestId: `${isAntigravity ? "agent" : "pi"}-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`,
 	};
+}
+
+type ClampedThinkingLevel = Exclude<ThinkingLevel, "xhigh">;
+
+function getGeminiCliThinkingLevel(effort: ClampedThinkingLevel, modelId: string): GoogleThinkingLevel {
+	if (modelId.includes("3-pro")) {
+		switch (effort) {
+			case "minimal":
+			case "low":
+				return "LOW";
+			case "medium":
+			case "high":
+				return "HIGH";
+		}
+	}
+	switch (effort) {
+		case "minimal":
+			return "MINIMAL";
+		case "low":
+			return "LOW";
+		case "medium":
+			return "MEDIUM";
+		case "high":
+			return "HIGH";
+	}
 }

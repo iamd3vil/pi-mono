@@ -32,6 +32,7 @@ import type {
 	ExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
+	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types.js";
@@ -122,6 +123,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
 		flagValues: new Map(),
+		pendingProviderRegistrations: [],
 	};
 }
 
@@ -236,6 +238,10 @@ function createExtensionAPI(
 
 		setThinkingLevel(level) {
 			runtime.setThinkingLevel(level);
+		},
+
+		registerProvider(name: string, config: ProviderConfig) {
+			runtime.pendingProviderRegistrations.push({ name, config });
 		},
 
 		events: eventBus,
@@ -487,11 +493,15 @@ export async function discoverAndLoadExtensions(
 	for (const p of configuredPaths) {
 		const resolved = resolvePath(p, cwd);
 		if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+			// Check for package.json with pi manifest or index.ts
 			const entries = resolveExtensionEntries(resolved);
 			if (entries) {
 				addPaths(entries);
 				continue;
 			}
+			// No explicit entries - discover individual files in directory
+			addPaths(discoverExtensionsInDir(resolved));
+			continue;
 		}
 
 		addPaths([resolved]);

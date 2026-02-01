@@ -474,6 +474,35 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			}
 		}
 
+		// Process Hugging Face models
+		if (data.huggingface?.models) {
+			for (const [modelId, model] of Object.entries(data.huggingface.models)) {
+				const m = model as ModelsDevModel;
+				if (m.tool_call !== true) continue;
+
+				models.push({
+					id: modelId,
+					name: m.name || modelId,
+					api: "openai-completions",
+					provider: "huggingface",
+					baseUrl: "https://router.huggingface.co/v1",
+					reasoning: m.reasoning === true,
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
+					},
+					compat: {
+						supportsDeveloperRole: false,
+					},
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
+				});
+			}
+		}
+
 		// Process OpenCode Zen models
 		// API mapping based on provider.npm field:
 		// - @ai-sdk/openai → openai-responses
@@ -482,8 +511,9 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 		// - null/undefined/@ai-sdk/openai-compatible → openai-completions
 		if (data.opencode?.models) {
 			for (const [modelId, model] of Object.entries(data.opencode.models)) {
-				const m = model as ModelsDevModel;
+				const m = model as ModelsDevModel & { status?: string };
 				if (m.tool_call !== true) continue;
+				if (m.status === "deprecated") continue;
 
 				const npm = m.provider?.npm;
 				let api: Api;
@@ -597,6 +627,33 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						maxTokens: m.limit?.output || 4096,
 					});
 				}
+			}
+		}
+
+		// Process Kimi For Coding models
+		if (data["kimi-for-coding"]?.models) {
+			for (const [modelId, model] of Object.entries(data["kimi-for-coding"].models)) {
+				const m = model as ModelsDevModel;
+				if (m.tool_call !== true) continue;
+
+				models.push({
+					id: modelId,
+					name: m.name || modelId,
+					api: "anthropic-messages",
+					provider: "kimi-coding",
+					// Kimi For Coding's Anthropic-compatible API - SDK appends /v1/messages
+					baseUrl: "https://api.kimi.com/coding",
+					reasoning: m.reasoning === true,
+					input: m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"],
+					cost: {
+						input: m.cost?.input || 0,
+						output: m.cost?.output || 0,
+						cacheRead: m.cost?.cache_read || 0,
+						cacheWrite: m.cost?.cache_write || 0,
+					},
+					contextWindow: m.limit?.context || 4096,
+					maxTokens: m.limit?.output || 4096,
+				});
 			}
 		}
 
@@ -1100,6 +1157,52 @@ async function generateModels() {
 	];
 	allModels.push(...vertexModels);
 
+	// Kimi For Coding models (Moonshot AI's Anthropic-compatible coding API)
+	// Static fallback in case models.dev doesn't have them yet
+	const KIMI_CODING_BASE_URL = "https://api.kimi.com/coding";
+	const kimiCodingModels: Model<"anthropic-messages">[] = [
+		{
+			id: "kimi-k2-thinking",
+			name: "Kimi K2 Thinking",
+			api: "anthropic-messages",
+			provider: "kimi-coding",
+			baseUrl: KIMI_CODING_BASE_URL,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262144,
+			maxTokens: 32768,
+		},
+		{
+			id: "k2p5",
+			name: "Kimi K2.5",
+			api: "anthropic-messages",
+			provider: "kimi-coding",
+			baseUrl: KIMI_CODING_BASE_URL,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 262144,
+			maxTokens: 32768,
+		},
+	];
+	// Only add if not already present from models.dev
+	for (const model of kimiCodingModels) {
+		if (!allModels.some(m => m.provider === "kimi-coding" && m.id === model.id)) {
+			allModels.push(model);
+		}
+	}
+
+	const azureOpenAiModels: Model<Api>[] = allModels
+		.filter((model) => model.provider === "openai" && model.api === "openai-responses")
+		.map((model) => ({
+			...model,
+			api: "azure-openai-responses",
+			provider: "azure-openai-responses",
+			baseUrl: "",
+		}));
+	allModels.push(...azureOpenAiModels);
+
 	// Group by provider and deduplicate by model ID
 	const providers: Record<string, Record<string, Model<any>>> = {};
 	for (const model of allModels) {
@@ -1136,7 +1239,7 @@ export const MODELS = {
 			output += `\t\t\tname: "${model.name}",\n`;
 			output += `\t\t\tapi: "${model.api}",\n`;
 			output += `\t\t\tprovider: "${model.provider}",\n`;
-			if (model.baseUrl) {
+			if (model.baseUrl !== undefined) {
 				output += `\t\t\tbaseUrl: "${model.baseUrl}",\n`;
 			}
 			if (model.headers) {

@@ -6,6 +6,7 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
 import type { KeyId } from "@mariozechner/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.js";
+import type { ResourceDiagnostic } from "../diagnostics.js";
 import type { KeyAction, KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { SessionManager } from "../session-manager.js";
@@ -34,6 +35,8 @@ import type {
 	MessageRenderer,
 	RegisteredCommand,
 	RegisteredTool,
+	ResourcesDiscoverEvent,
+	ResourcesDiscoverResult,
 	SessionBeforeCompactResult,
 	SessionBeforeTreeResult,
 	ToolCallEvent,
@@ -158,10 +161,12 @@ export class ExtensionRunner {
 	private hasPendingMessagesFn: () => boolean = () => false;
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
+	private getSystemPromptFn: () => string = () => "";
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
 	private shutdownHandler: ShutdownHandler = () => {};
+	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 
 	constructor(
 		extensions: Extension[],
@@ -201,6 +206,13 @@ export class ExtensionRunner {
 		this.shutdownHandler = contextActions.shutdown;
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
+		this.getSystemPromptFn = contextActions.getSystemPrompt;
+
+		// Process provider registrations queued during extension loading
+		for (const { name, config } of this.runtime.pendingProviderRegistrations) {
+			this.modelRegistry.registerProvider(name, config);
+		}
+		this.runtime.pendingProviderRegistrations = [];
 	}
 
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
@@ -275,36 +287,52 @@ export class ExtensionRunner {
 	}
 
 	getShortcuts(effectiveKeybindings: Required<KeybindingsConfig>): Map<KeyId, ExtensionShortcut> {
+		this.shortcutDiagnostics = [];
 		const builtinKeybindings = buildBuiltinKeybindings(effectiveKeybindings);
 		const extensionShortcuts = new Map<KeyId, ExtensionShortcut>();
+
+		const addDiagnostic = (message: string, extensionPath: string) => {
+			this.shortcutDiagnostics.push({ type: "warning", message, path: extensionPath });
+			if (!this.hasUI()) {
+				console.warn(message);
+			}
+		};
+
 		for (const ext of this.extensions) {
 			for (const [key, shortcut] of ext.shortcuts) {
 				const normalizedKey = key.toLowerCase() as KeyId;
 
 				const builtInKeybinding = builtinKeybindings[normalizedKey];
 				if (builtInKeybinding?.restrictOverride === true) {
-					console.warn(
+					addDiagnostic(
 						`Extension shortcut '${key}' from ${shortcut.extensionPath} conflicts with built-in shortcut. Skipping.`,
+						shortcut.extensionPath,
 					);
 					continue;
 				}
 
 				if (builtInKeybinding?.restrictOverride === false) {
-					console.warn(
+					addDiagnostic(
 						`Extension shortcut conflict: '${key}' is built-in shortcut for ${builtInKeybinding.action} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
+						shortcut.extensionPath,
 					);
 				}
 
 				const existingExtensionShortcut = extensionShortcuts.get(normalizedKey);
 				if (existingExtensionShortcut) {
-					console.warn(
+					addDiagnostic(
 						`Extension shortcut conflict: '${key}' registered by both ${existingExtensionShortcut.extensionPath} and ${shortcut.extensionPath}. Using ${shortcut.extensionPath}.`,
+						shortcut.extensionPath,
 					);
 				}
 				extensionShortcuts.set(normalizedKey, shortcut);
 			}
 		}
 		return extensionShortcuts;
+	}
+
+	getShortcutDiagnostics(): ResourceDiagnostic[] {
+		return this.shortcutDiagnostics;
 	}
 
 	onError(listener: ExtensionErrorListener): () => void {
@@ -348,6 +376,16 @@ export class ExtensionRunner {
 		return commands;
 	}
 
+	getRegisteredCommandsWithPaths(): Array<{ command: RegisteredCommand; extensionPath: string }> {
+		const result: Array<{ command: RegisteredCommand; extensionPath: string }> = [];
+		for (const ext of this.extensions) {
+			for (const command of ext.commands.values()) {
+				result.push({ command, extensionPath: ext.path });
+			}
+		}
+		return result;
+	}
+
 	getCommand(name: string): RegisteredCommand | undefined {
 		for (const ext of this.extensions) {
 			const command = ext.commands.get(name);
@@ -387,6 +425,7 @@ export class ExtensionRunner {
 			shutdown: () => this.shutdownHandler(),
 			getContextUsage: () => this.getContextUsageFn(),
 			compact: (options) => this.compactFn(options),
+			getSystemPrompt: () => this.getSystemPromptFn(),
 		};
 	}
 
@@ -590,6 +629,54 @@ export class ExtensionRunner {
 		}
 
 		return undefined;
+	}
+
+	async emitResourcesDiscover(
+		cwd: string,
+		reason: ResourcesDiscoverEvent["reason"],
+	): Promise<{
+		skillPaths: Array<{ path: string; extensionPath: string }>;
+		promptPaths: Array<{ path: string; extensionPath: string }>;
+		themePaths: Array<{ path: string; extensionPath: string }>;
+	}> {
+		const ctx = this.createContext();
+		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
+		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
+		const themePaths: Array<{ path: string; extensionPath: string }> = [];
+
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("resources_discover");
+			if (!handlers || handlers.length === 0) continue;
+
+			for (const handler of handlers) {
+				try {
+					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
+					const handlerResult = await handler(event, ctx);
+					const result = handlerResult as ResourcesDiscoverResult | undefined;
+
+					if (result?.skillPaths?.length) {
+						skillPaths.push(...result.skillPaths.map((path) => ({ path, extensionPath: ext.path })));
+					}
+					if (result?.promptPaths?.length) {
+						promptPaths.push(...result.promptPaths.map((path) => ({ path, extensionPath: ext.path })));
+					}
+					if (result?.themePaths?.length) {
+						themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path })));
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "resources_discover",
+						error: message,
+						stack,
+					});
+				}
+			}
+		}
+
+		return { skillPaths, promptPaths, themePaths };
 	}
 
 	/** Emit input event. Transforms chain, "handled" short-circuits. */
